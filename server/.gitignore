@@ -1,0 +1,13 @@
+node_modules/
+dist/
+
+.env
+.env.local
+
+temp/
+tmp/
+
+*.mp4
+*.mp3
+*.webm
+*.m4a
