@@ -179,6 +179,9 @@ export default function Home() {
   const [isAnalyzing, setIsAnalyzing] =
     useState(false);
 
+  const [isWakingUp, setIsWakingUp] =
+    useState(false);
+
   const [
     downloadingFormat,
     setDownloadingFormat,
@@ -217,6 +220,11 @@ export default function Home() {
     setSuccess(null);
     setMedia(null);
     setIsAnalyzing(true);
+    setIsWakingUp(false);
+
+    const wakeUpTimer = window.setTimeout(() => {
+      setIsWakingUp(true);
+    }, 8000);
 
     try {
       const response =
@@ -238,6 +246,8 @@ export default function Home() {
 
       const data =
         await response.json();
+
+      setIsWakingUp(false);
 
       if (!response.ok) {
         throw new Error(
@@ -268,6 +278,7 @@ export default function Home() {
           });
       }, 150);
     } catch (requestError) {
+      setIsWakingUp(false);
       console.error(
         "Analyze error:",
         requestError
@@ -279,6 +290,8 @@ export default function Home() {
           : "Unable to analyze this media right now."
       );
     } finally {
+      window.clearTimeout(wakeUpTimer);
+      setIsWakingUp(false);
       setIsAnalyzing(false);
     }
   }
@@ -637,6 +650,50 @@ export default function Home() {
                 </button>
               </div>
             </form>
+
+            {isAnalyzing && (
+              <div
+                role="status"
+                aria-live="polite"
+                className="mx-auto mt-5 flex max-w-3xl items-start gap-3 rounded-xl border border-cyan-400/20 bg-cyan-400/5 px-4 py-3 text-left"
+              >
+                <svg
+                  className="mt-0.5 h-5 w-5 shrink-0 animate-spin motion-reduce:animate-none text-cyan-400"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  aria-hidden="true"
+                >
+                  <circle
+                    className="opacity-25"
+                    cx="12"
+                    cy="12"
+                    r="10"
+                    stroke="currentColor"
+                    strokeWidth="4"
+                  />
+
+                  <path
+                    className="opacity-75"
+                    fill="currentColor"
+                    d="M4 12a8 8 0 018-8v4a4 4 0 00-4 4H4z"
+                  />
+                </svg>
+
+                <div className="min-w-0">
+                  <p className="text-sm font-semibold text-white">
+                    {isWakingUp
+                      ? "SaveFlow is waking up."
+                      : "Analyzing media..."}
+                  </p>
+
+                  <p className="mt-1 wrap-break-word text-xs leading-5 text-zinc-400 sm:text-sm">
+                    {isWakingUp
+                      ? "The free server may have gone to sleep. This can take up to about a minute. Please keep this page open."
+                      : "We’re checking the URL and preparing the available formats."}
+                  </p>
+                </div>
+              </div>
+            )}
 
             {/* Error */}
             {error && (
