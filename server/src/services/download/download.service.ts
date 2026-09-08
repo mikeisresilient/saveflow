@@ -4,6 +4,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
 import crypto from "node:crypto";
+import { env } from "../../config/env.js";
 import {
   MAX_DOWNLOAD_SIZE_BYTES,
 } from "../../utils/limits.utils.js";
@@ -64,8 +65,7 @@ function sanitizeFileName(name: string): string {
  * in the .env file.
  */
 const FFMPEG_PATH =
-  process.env.FFMPEG_PATH ||
-  "C:\\Users\\HomePC\\AppData\\Local\\Microsoft\\WinGet\\Packages\\Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe\\ffmpeg-9.0.1-full_build\\bin";
+  env.ffmpegPath;
 
 function getCommandErrorMessage(
   error: unknown

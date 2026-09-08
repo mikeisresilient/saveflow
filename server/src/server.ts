@@ -1,59 +1,173 @@
-import express from "express";
+import express, {
+  Request,
+  Response,
+  NextFunction,
+} from "express";
 import cors from "cors";
 import helmet from "helmet";
-import rateLimit from "express-rate-limit";
-import dotenv from "dotenv";
+
+import {
+  generalLimiter,
+} from "./middleware/rate-limit.middleware.js";
+
 import mediaRoutes from "./routes/media.routes.js";
+
 import {
   cleanupOldTempFiles,
 } from "./utils/temp-cleanup.utils.js";
 
-dotenv.config();
+import { env } from "./config/env.js";
 
 const app = express();
 
-const PORT = process.env.PORT || 5000;
+app.disable("x-powered-by");
 
-const limiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  limit: 100,
-  standardHeaders: true,
-  legacyHeaders: false,
-});
-
-app.use(helmet());
+app.set("trust proxy", 1);
 
 app.use(
-  cors({
-    origin: process.env.FRONTEND_URL || "http://localhost:3000",
+  helmet({
+    crossOriginResourcePolicy: {
+      policy: "cross-origin",
+    },
   })
 );
 
-app.use(express.json({ limit: "1mb" }));
+app.use(
+  cors({
+    origin(origin, callback) {
+      if (!origin) {
+        return callback(null, true);
+      }
 
-app.use(limiter);
+      if (
+        env.frontendUrls.includes(origin)
+      ) {
+        return callback(null, true);
+      }
 
-app.use("/api/media", mediaRoutes);
+      return callback(
+        new Error(
+          "Origin is not allowed by SaveFlow."
+        )
+      );
+    },
 
-app.get("/", (_req, res) => {
-  res.json({
-    success: true,
-    message: "SaveFlow API is running",
-  });
-});
+    methods: [
+      "GET",
+      "POST",
+      "OPTIONS",
+    ],
 
-app.get("/api/health", (_req, res) => {
-  res.json({
-    success: true,
-    status: "healthy",
-    timestamp: new Date().toISOString(),
-  });
-});
+    allowedHeaders: [
+      "Content-Type",
+      "Accept",
+    ],
+  })
+);
 
-app.listen(PORT, async () => {
-  console.log(
-    `SaveFlow API running on http://localhost:${PORT}`
-  );
+app.use(
+  express.json({
+    limit: "1mb",
+  })
+);
 
+app.use(generalLimiter);
+
+app.get(
+  "/",
+  (
+    _req: Request,
+    res: Response
+  ) => {
+    res.json({
+      success: true,
+      message:
+        "SaveFlow API is running",
+      environment:
+        env.nodeEnv,
+    });
+  }
+);
+
+app.get(
+  "/api/health",
+  (
+    _req: Request,
+    res: Response
+  ) => {
+    res.json({
+      success: true,
+      status: "healthy",
+      timestamp:
+        new Date().toISOString(),
+    });
+  }
+);
+
+app.use(
+  "/api/media",
+  mediaRoutes
+);
+
+app.use(
+  (
+    _req: Request,
+    res: Response
+  ) => {
+    res.status(404).json({
+      success: false,
+      message:
+        "Route not found.",
+    });
+  }
+);
+
+app.use(
+  (
+    error: Error,
+    _req: Request,
+    res: Response,
+    _next: NextFunction
+  ) => {
+    console.error(
+      "Unhandled API error:",
+      error
+    );
+
+    res.status(500).json({
+      success: false,
+      message:
+        env.isProduction
+          ? "Something went wrong."
+          : error.message,
+    });
+  }
+);
+
+async function startServer() {
   await cleanupOldTempFiles();
-});
+
+  app.listen(
+    env.port,
+    () => {
+      console.log(
+        `SaveFlow API running on http://localhost:${env.port}`
+      );
+
+      console.log(
+        `Environment: ${env.nodeEnv}`
+      );
+    }
+  );
+}
+
+startServer().catch(
+  (error) => {
+    console.error(
+      "Unable to start SaveFlow:",
+      error
+    );
+
+    process.exit(1);
+  }
+);
