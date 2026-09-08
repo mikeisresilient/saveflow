@@ -7,6 +7,7 @@ import {
 
 import {
   getMediaInfo,
+  MediaInfoError,
 } from "../services/media.service.js";
 
 import {
@@ -69,7 +70,24 @@ router.post(
         error
       );
 
-      return res.status(400).json({
+      /*
+       * Use the status code provided by
+       * MediaInfoError when available.
+       *
+       * This allows platform blocking,
+       * timeouts, and other known errors
+       * to return the appropriate HTTP
+       * response instead of everything
+       * becoming a 400 error.
+       */
+      const statusCode =
+        error instanceof MediaInfoError
+          ? error.statusCode
+          : 400;
+
+      return res.status(
+        statusCode
+      ).json({
         success: false,
         error:
           error instanceof Error
