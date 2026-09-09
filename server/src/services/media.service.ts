@@ -6,7 +6,8 @@ import {
   RawFormat,
 } from "../utils/format.utils.js";
 
-const execFileAsync = promisify(execFile);
+const execFileAsync =
+  promisify(execFile);
 
 export class MediaInfoError extends Error {
   statusCode: number;
@@ -18,9 +19,15 @@ export class MediaInfoError extends Error {
     code = "MEDIA_INFO_ERROR"
   ) {
     super(message);
-    this.name = "MediaInfoError";
-    this.statusCode = statusCode;
-    this.code = code;
+
+    this.name =
+      "MediaInfoError";
+
+    this.statusCode =
+      statusCode;
+
+    this.code =
+      code;
   }
 }
 
@@ -32,55 +39,57 @@ function getFriendlyMediaError(
       ? error.message
       : String(error);
 
-  const lowerMessage =
+  const lower =
     message.toLowerCase();
 
-  /*
-   * YouTube or another platform is
-   * blocking automated requests.
-   */
   if (
-    lowerMessage.includes(
+    lower.includes(
       "sign in to confirm"
     ) ||
-    lowerMessage.includes(
+    lower.includes(
       "not a bot"
     ) ||
-    lowerMessage.includes(
+    lower.includes(
       "http error 403"
     ) ||
-    lowerMessage.includes(
+    lower.includes(
+      "http error 429"
+    ) ||
+    lower.includes(
       "cookies-from-browser"
     ) ||
-    lowerMessage.includes(
-      "cookies or authentication"
+    lower.includes(
+      "po token"
     ) ||
-    lowerMessage.includes(
-      "unable to download api page"
+    lower.includes(
+      "botguard"
     )
   ) {
     return new MediaInfoError(
-      "This platform is temporarily unavailable. The platform is currently blocking automated requests from SaveFlow. Please try another supported URL.",
+      "This platform is currently blocking automated requests from SaveFlow. Please try again later or use another supported URL.",
       503,
       "PLATFORM_BLOCKED"
     );
   }
 
-  /*
-   * Private or unavailable media.
-   */
   if (
-    lowerMessage.includes(
+    lower.includes(
       "video unavailable"
     ) ||
-    lowerMessage.includes(
+    lower.includes(
       "this video is unavailable"
     ) ||
-    lowerMessage.includes(
+    lower.includes(
       "private video"
     ) ||
-    lowerMessage.includes(
+    lower.includes(
+      "private media"
+    ) ||
+    lower.includes(
       "content is not available"
+    ) ||
+    lower.includes(
+      "media unavailable"
     )
   ) {
     return new MediaInfoError(
@@ -90,15 +99,15 @@ function getFriendlyMediaError(
     );
   }
 
-  /*
-   * Unsupported platform or URL.
-   */
   if (
-    lowerMessage.includes(
+    lower.includes(
       "unsupported url"
     ) ||
-    lowerMessage.includes(
+    lower.includes(
       "no suitable extractor"
+    ) ||
+    lower.includes(
+      "unsupported site"
     )
   ) {
     return new MediaInfoError(
@@ -108,24 +117,24 @@ function getFriendlyMediaError(
     );
   }
 
-  /*
-   * Network or timeout problems.
-   */
   if (
-    lowerMessage.includes(
+    lower.includes(
       "timed out"
     ) ||
-    lowerMessage.includes(
+    lower.includes(
       "timeout"
     ) ||
-    lowerMessage.includes(
+    lower.includes(
       "connection reset"
     ) ||
-    lowerMessage.includes(
+    lower.includes(
       "network is unreachable"
     ) ||
-    lowerMessage.includes(
+    lower.includes(
       "temporary failure"
+    ) ||
+    lower.includes(
+      "unable to connect"
     )
   ) {
     return new MediaInfoError(
@@ -135,15 +144,15 @@ function getFriendlyMediaError(
     );
   }
 
-  /*
-   * Unexpected response from the extractor.
-   */
   if (
-    lowerMessage.includes(
+    lower.includes(
       "unexpected token"
     ) ||
-    lowerMessage.includes(
+    lower.includes(
       "json.parse"
+    ) ||
+    lower.includes(
+      "invalid json"
     )
   ) {
     return new MediaInfoError(
@@ -153,12 +162,6 @@ function getFriendlyMediaError(
     );
   }
 
-  /*
-   * Safe generic fallback.
-   *
-   * Do not expose the raw yt-dlp command
-   * or internal server information.
-   */
   return new MediaInfoError(
     "Unable to analyze this media URL right now. Please check the URL and try again.",
     400,
@@ -176,16 +179,45 @@ export async function getMediaInfo(
         [
           "-m",
           "yt_dlp",
+
           "--dump-single-json",
+
           "--skip-download",
+
           "--no-playlist",
+
+          /*
+           * Let yt-dlp verify that the formats
+           * are actually reachable.
+           */
+          "--check-formats",
+
+          /*
+           * Deno is installed in the production
+           * Docker image and is the recommended
+           * JS runtime for yt-dlp EJS.
+           */
+          "--js-runtimes",
+          "deno",
+
+          /*
+           * Allow yt-dlp to obtain the current
+           * EJS challenge scripts when needed.
+           */
+          "--remote-components",
+          "ejs:npm",
+
           url,
         ],
         {
           maxBuffer:
-            10 * 1024 * 1024,
-          timeout: 30_000,
-          windowsHide: true,
+            20 * 1024 * 1024,
+
+          timeout:
+            60_000,
+
+          windowsHide:
+            true,
         }
       );
 
@@ -193,42 +225,63 @@ export async function getMediaInfo(
       JSON.parse(stdout);
 
     const rawFormats: RawFormat[] =
-      Array.isArray(data.formats)
-        ? data.formats.map(
-            (format: any) => ({
-              formatId:
-                format.format_id,
+      Array.isArray(
+        data.formats
+      )
+        ? data.formats
+            .map(
+              (format: any) => ({
+                formatId:
+                  String(
+                    format.format_id
+                  ),
 
-              extension:
-                format.ext,
+                extension:
+                  String(
+                    format.ext || ""
+                  ),
 
-              width:
-                format.width,
+                width:
+                  format.width ??
+                  null,
 
-              height:
-                format.height,
+                height:
+                  format.height ??
+                  null,
 
-              resolution:
-                format.resolution,
+                resolution:
+                  format.resolution ??
+                  null,
 
-              fps:
-                format.fps,
+                fps:
+                  format.fps ??
+                  null,
 
-              videoCodec:
-                format.vcodec,
+                videoCodec:
+                  format.vcodec ??
+                  null,
 
-              audioCodec:
-                format.acodec,
+                audioCodec:
+                  format.acodec ??
+                  null,
 
-              fileSize:
-                format.filesize ??
-                format.filesize_approx ??
-                null,
+                fileSize:
+                  format.filesize ??
+                  format.filesize_approx ??
+                  null,
 
-              bitrate:
-                format.tbr,
-            })
-          )
+                bitrate:
+                  format.abr ??
+                  format.tbr ??
+                  null,
+              })
+            )
+            .filter(
+              (format: RawFormat) =>
+                Boolean(
+                  format.formatId
+                )
+            )
         : [];
 
     const formats =
@@ -237,36 +290,46 @@ export async function getMediaInfo(
       );
 
     return {
-      id: data.id,
-      title: data.title,
+      id:
+        data.id,
+
+      title:
+        data.title ||
+        "Untitled media",
+
       description:
-        data.description,
+        data.description ||
+        null,
+
       thumbnail:
-        data.thumbnail,
+        data.thumbnail ||
+        null,
+
       duration:
-        data.duration,
+        data.duration ??
+        null,
+
       uploader:
-        data.uploader,
+        data.uploader ||
+        data.channel ||
+        null,
+
       webpageUrl:
-        data.webpage_url,
+        data.webpage_url ||
+        url,
+
       extractor:
-        data.extractor,
+        data.extractor ||
+        null,
+
       formats,
     };
   } catch (error) {
-    /*
-     * Keep the technical error in Render
-     * logs for debugging.
-     */
     console.error(
       "yt-dlp media info error:",
       error
     );
 
-    /*
-     * Return only a safe, user-friendly
-     * error to the route.
-     */
     throw getFriendlyMediaError(
       error
     );

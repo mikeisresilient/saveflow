@@ -36,20 +36,6 @@ export interface ProcessedFormats {
   audio: AudioFormat[];
 }
 
-function formatFileSize(bytes: number | null): string | null {
-  if (!bytes) {
-    return null;
-  }
-
-  const mb = bytes / (1024 * 1024);
-
-  if (mb < 1) {
-    return `${Math.round(bytes / 1024)} KB`;
-  }
-
-  return `${mb.toFixed(1)} MB`;
-}
-
 function getVideoQuality(height: number): string {
   if (height >= 2160) return "2160p";
   if (height >= 1440) return "1440p";
@@ -62,7 +48,9 @@ function getVideoQuality(height: number): string {
   return `${height}p`;
 }
 
-function getAudioQuality(bitrate: number | null): string {
+function getAudioQuality(
+  bitrate: number | null
+): string {
   if (!bitrate) {
     return "Audio";
   }
@@ -75,76 +63,409 @@ function getAudioQuality(bitrate: number | null): string {
   return `${Math.round(bitrate)} kbps`;
 }
 
+function hasVideo(
+  format: RawFormat
+): boolean {
+  return Boolean(
+    format.videoCodec &&
+      format.videoCodec !== "none" &&
+      format.width &&
+      format.height &&
+      format.width > 0 &&
+      format.height > 0
+  );
+}
+
+/*
+ * IMPORTANT:
+ *
+ * Audio formats must be AUDIO ONLY.
+ *
+ * A format containing both video and audio
+ * must never appear in the Audio Formats list.
+ *
+ * Example:
+ *
+ * h264 + aac = VIDEO format
+ * none + aac = AUDIO ONLY format
+ */
+function hasAudio(
+  format: RawFormat
+): boolean {
+  return Boolean(
+    format.audioCodec &&
+      format.audioCodec !== "none" &&
+      (!format.videoCodec ||
+        format.videoCodec === "none")
+  );
+}
+
+function isUsableVideoExtension(
+  extension: string
+): boolean {
+  const ext = extension.toLowerCase();
+
+  return (
+    ext === "mp4" ||
+    ext === "webm" ||
+    ext === "mov"
+  );
+}
+
+function isUsableAudioExtension(
+  extension: string
+): boolean {
+  const ext = extension.toLowerCase();
+
+  return (
+    ext === "m4a" ||
+    ext === "webm" ||
+    ext === "mp4" ||
+    ext === "mp3"
+  );
+}
+
+function getVideoScore(
+  format: RawFormat
+): number {
+  const extension =
+    format.extension.toLowerCase();
+
+  const hasAudioStream =
+    Boolean(
+      format.audioCodec &&
+        format.audioCodec !== "none"
+    );
+
+  let score = 0;
+
+  /*
+   * Prefer MP4 because the final SaveFlow
+   * output is MP4.
+   */
+  if (extension === "mp4") {
+    score += 100;
+  }
+
+  /*
+   * Prefer a format that already contains
+   * audio. This is especially important for
+   * platforms where some formats are already
+   * combined video + audio.
+   */
+  if (hasAudioStream) {
+    score += 50;
+  }
+
+  /*
+   * Prefer a format with a known file size.
+   */
+  if (format.fileSize) {
+    score += 10;
+  }
+
+  /*
+   * Prefer higher frame rates when the
+   * resolution is otherwise identical.
+   */
+  if (format.fps) {
+    score += Math.min(
+      format.fps,
+      60
+    ) / 10;
+  }
+
+  return score;
+}
+
+function getAudioScore(
+  format: RawFormat
+): number {
+  const extension =
+    format.extension.toLowerCase();
+
+  let score = 0;
+
+  /*
+   * M4A/AAC is preferred because FFmpeg can
+   * reliably convert it to MP3.
+   */
+  if (extension === "m4a") {
+    score += 100;
+  } else if (extension === "webm") {
+    score += 80;
+  } else if (extension === "mp4") {
+    score += 70;
+  } else if (extension === "mp3") {
+    score += 60;
+  }
+
+  /*
+   * Prefer higher bitrate when comparing
+   * otherwise equivalent audio formats.
+   */
+  score += Math.min(
+    format.bitrate ?? 0,
+    320
+  ) / 10;
+
+  return score;
+}
+
 export function processFormats(
   formats: RawFormat[]
 ): ProcessedFormats {
-  const videoMap = new Map<string, VideoFormat>();
-  const audioMap = new Map<string, AudioFormat>();
+  const videoMap =
+    new Map<string, VideoFormat>();
+
+  const audioMap =
+    new Map<string, AudioFormat>();
 
   for (const format of formats) {
-    const hasVideo =
-      format.videoCodec &&
-      format.videoCodec !== "none" &&
-      format.width &&
-      format.height;
+    /*
+     * ============================
+     * VIDEO
+     * ============================
+     *
+     * Any format containing a video
+     * stream belongs in the Video list.
+     *
+     * This includes:
+     *
+     * video only
+     * video + audio
+     */
+    if (
+      hasVideo(format) &&
+      isUsableVideoExtension(
+        format.extension
+      )
+    ) {
+      const quality =
+        getVideoQuality(
+          format.height!
+        );
 
-    const hasAudio =
-      format.audioCodec &&
-      format.audioCodec !== "none";
+      const existing =
+        videoMap.get(quality);
 
-    if (hasVideo) {
-      const quality = getVideoQuality(format.height!);
+      const currentScore =
+        getVideoScore(format);
 
-      // We only want MP4 video formats for the initial version.
-      if (format.extension !== "mp4") {
-        continue;
-      }
-
-      // Avoid exposing duplicate qualities.
-      if (!videoMap.has(quality)) {
+      if (!existing) {
         videoMap.set(quality, {
-          formatId: format.formatId,
+          formatId:
+            format.formatId,
+
           type: "video",
+
           quality,
-          extension: format.extension,
-          width: format.width!,
-          height: format.height!,
-          fps: format.fps ?? null,
-          fileSize: format.fileSize ?? null,
+
+          extension:
+            format.extension.toLowerCase(),
+
+          width:
+            format.width!,
+
+          height:
+            format.height!,
+
+          fps:
+            format.fps ?? null,
+
+          fileSize:
+            format.fileSize ?? null,
         });
+      } else {
+        /*
+         * Reconstruct the basic score of
+         * the existing format.
+         */
+        const existingScore =
+          getVideoScore({
+            formatId:
+              existing.formatId,
+
+            extension:
+              existing.extension,
+
+            width:
+              existing.width,
+
+            height:
+              existing.height,
+
+            fps:
+              existing.fps,
+
+            fileSize:
+              existing.fileSize,
+
+            videoCodec:
+              "video",
+
+            /*
+             * We don't know whether the stored
+             * format contains audio, so this
+             * remains null.
+             */
+            audioCodec:
+              null,
+
+            resolution:
+              null,
+
+            bitrate:
+              null,
+          });
+
+        if (
+          currentScore >
+          existingScore
+        ) {
+          videoMap.set(quality, {
+            formatId:
+              format.formatId,
+
+            type: "video",
+
+            quality,
+
+            extension:
+              format.extension.toLowerCase(),
+
+            width:
+              format.width!,
+
+            height:
+              format.height!,
+
+            fps:
+              format.fps ?? null,
+
+            fileSize:
+              format.fileSize ?? null,
+          });
+        }
       }
     }
 
-    if (hasAudio) {
-      const isAudioFormat =
-        format.extension === "m4a" ||
-        format.extension === "webm";
+    /*
+     * ============================
+     * AUDIO ONLY
+     * ============================
+     *
+     * IMPORTANT:
+     *
+     * hasAudio() now guarantees that
+     * the format does NOT contain video.
+     *
+     * Therefore formats such as:
+     *
+     * h264_540p_431187-0
+     *
+     * will NOT be added to Audio.
+     */
+    if (
+      hasAudio(format) &&
+      isUsableAudioExtension(
+        format.extension
+      )
+    ) {
+      const quality =
+        getAudioQuality(
+          format.bitrate ?? null
+        );
 
-      if (!isAudioFormat) {
-        continue;
-      }
+      const existing =
+        audioMap.get(quality);
 
-      const quality = getAudioQuality(format.bitrate ?? null);
-
-      /*
-       * Prefer m4a because it is easier to convert to MP3
-       * with FFmpeg later.
-       */
-      if (
-        format.extension === "m4a" &&
-        !audioMap.has(quality)
-      ) {
+      if (!existing) {
         audioMap.set(quality, {
-          formatId: format.formatId,
+          formatId:
+            format.formatId,
+
           type: "audio",
+
           quality,
-          extension: format.extension,
-          bitrate: format.bitrate ?? null,
-          fileSize: format.fileSize ?? null,
+
+          extension:
+            format.extension.toLowerCase(),
+
+          bitrate:
+            format.bitrate ?? null,
+
+          fileSize:
+            format.fileSize ?? null,
         });
+      } else {
+        const currentScore =
+          getAudioScore(format);
+
+        const existingScore =
+          getAudioScore({
+            formatId:
+              existing.formatId,
+
+            extension:
+              existing.extension,
+
+            bitrate:
+              existing.bitrate,
+
+            fileSize:
+              existing.fileSize,
+
+            width:
+              null,
+
+            height:
+              null,
+
+            resolution:
+              null,
+
+            fps:
+              null,
+
+            videoCodec:
+              null,
+
+            audioCodec:
+              "audio",
+          });
+
+        if (
+          currentScore >
+          existingScore
+        ) {
+          audioMap.set(quality, {
+            formatId:
+              format.formatId,
+
+            type: "audio",
+
+            quality,
+
+            extension:
+              format.extension.toLowerCase(),
+
+            bitrate:
+              format.bitrate ?? null,
+
+            fileSize:
+              format.fileSize ?? null,
+          });
+        }
       }
     }
   }
+
+  /*
+   * ============================
+   * SORT VIDEO
+   * ============================
+   */
 
   const qualityOrder = [
     "2160p",
@@ -156,15 +477,35 @@ export function processFormats(
     "240p",
   ];
 
-  const video = Array.from(videoMap.values()).sort(
-    (a, b) =>
-      qualityOrder.indexOf(a.quality) -
-      qualityOrder.indexOf(b.quality)
-  );
+  const video =
+    Array.from(
+      videoMap.values()
+    ).sort(
+      (a, b) =>
+        qualityOrder.indexOf(
+          a.quality
+        ) -
+        qualityOrder.indexOf(
+          b.quality
+        )
+    );
 
-  const audio = Array.from(audioMap.values()).sort(
-    (a, b) => (b.bitrate ?? 0) - (a.bitrate ?? 0)
-  );
+  /*
+   * ============================
+   * SORT AUDIO
+   * ============================
+   *
+   * Highest bitrate first.
+   */
+
+  const audio =
+    Array.from(
+      audioMap.values()
+    ).sort(
+      (a, b) =>
+        (b.bitrate ?? 0) -
+        (a.bitrate ?? 0)
+    );
 
   return {
     video,

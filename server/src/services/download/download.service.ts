@@ -4,6 +4,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
 import crypto from "node:crypto";
+
 import { env } from "../../config/env.js";
 import {
   MAX_DOWNLOAD_SIZE_BYTES,
@@ -23,6 +24,11 @@ interface DownloadResult {
   filePath: string;
   fileName: string;
   contentType: string;
+}
+
+interface ProbeResult {
+  videoCodec: string | null;
+  audioCodec: string | null;
 }
 
 export class DownloadError extends Error {
@@ -47,33 +53,19 @@ function createTempDirectory(): string {
 }
 
 function sanitizeFileName(name: string): string {
-  return name
+  const sanitized = name
     .replace(/[<>:"/\\|?*\x00-\x1F]/g, "")
     .replace(/\s+/g, " ")
     .trim()
     .slice(0, 150);
+
+  return sanitized || "saveflow-media";
 }
 
-/*
- * FFmpeg directory.
- *
- * This directory contains:
- * ffmpeg.exe
- * ffprobe.exe
- *
- * The value can be overridden with FFMPEG_PATH
- * in the .env file.
- */
-const FFMPEG_PATH =
-  env.ffmpegPath;
+const FFMPEG_PATH = env.ffmpegPath;
 
-function getCommandErrorMessage(
-  error: unknown
-): string {
-  if (
-    typeof error === "object" &&
-    error !== null
-  ) {
+function getCommandErrorMessage(error: unknown): string {
+  if (typeof error === "object" && error !== null) {
     const possibleError = error as {
       message?: string;
       stderr?: string;
@@ -124,7 +116,8 @@ function translateDownloadError(
 
   if (
     message.includes("private video") ||
-    message.includes("private media")
+    message.includes("private media") ||
+    message.includes("this account is private")
   ) {
     return new DownloadError(
       "This media is private and cannot be downloaded.",
@@ -136,7 +129,8 @@ function translateDownloadError(
     message.includes("login required") ||
     message.includes("sign in") ||
     message.includes("authentication") ||
-    message.includes("cookies")
+    message.includes("cookies") ||
+    message.includes("log in")
   ) {
     return new DownloadError(
       "This media requires authentication and cannot be downloaded.",
@@ -177,6 +171,17 @@ function translateDownloadError(
   }
 
   if (
+    message.includes("http error 403") ||
+    message.includes("forbidden") ||
+    message.includes("not a bot")
+  ) {
+    return new DownloadError(
+      "The platform is currently blocking this automated request. Please try again later or use another supported URL.",
+      503
+    );
+  }
+
+  if (
     message.includes("ffmpeg") ||
     message.includes("ffprobe") ||
     message.includes("postprocessing")
@@ -186,6 +191,11 @@ function translateDownloadError(
       500
     );
   }
+
+  console.error(
+    "FULL DOWNLOAD ERROR:",
+    getCommandErrorMessage(error)
+  );
 
   return new DownloadError(
     "Unable to download this media right now.",
@@ -198,7 +208,10 @@ async function validateActualFileSize(
 ): Promise<void> {
   const stats = await fs.stat(filePath);
 
-  if (stats.size > MAX_DOWNLOAD_SIZE_BYTES) {
+  if (
+    stats.size >
+    MAX_DOWNLOAD_SIZE_BYTES
+  ) {
     throw new DownloadError(
       "This download is too large. SaveFlow currently supports files up to 500 MB.",
       413
@@ -206,191 +219,430 @@ async function validateActualFileSize(
   }
 }
 
+async function runYtDlp(
+  args: string[],
+  timeout: number
+): Promise<void> {
+  const finalArgs = [
+    "--js-runtimes",
+    "deno",
+    "--remote-components",
+    "ejs:npm",
+    ...args,
+  ];
+
+  await execFileAsync(
+    "python",
+    [
+      "-m",
+      "yt_dlp",
+      ...finalArgs,
+    ],
+    {
+      maxBuffer: 10 * 1024 * 1024,
+      timeout,
+      windowsHide: true,
+    }
+  );
+}
+
+async function findDownloadedMedia(
+  tempDir: string,
+  extensions: string[]
+): Promise<string | null> {
+  const files = await fs.readdir(
+    tempDir,
+    { withFileTypes: true }
+  );
+
+  const candidates = files
+    .filter(
+      (entry) =>
+        entry.isFile() &&
+        extensions.some((extension) =>
+          entry.name
+            .toLowerCase()
+            .endsWith(extension)
+        )
+    )
+    .map((entry) =>
+      path.join(tempDir, entry.name)
+    );
+
+  if (candidates.length === 0) {
+    return null;
+  }
+
+  const filesWithStats = await Promise.all(
+    candidates.map(async (filePath) => ({
+      filePath,
+      stats: await fs.stat(filePath),
+    }))
+  );
+
+  filesWithStats.sort(
+    (a, b) =>
+      b.stats.mtimeMs -
+      a.stats.mtimeMs
+  );
+
+  return filesWithStats[0].filePath;
+}
+
+async function probeMedia(
+  filePath: string
+): Promise<ProbeResult> {
+  const { stdout } =
+    await execFileAsync(
+      "ffprobe",
+      [
+        "-v",
+        "error",
+        "-show_entries",
+        "stream=codec_type,codec_name",
+        "-of",
+        "json",
+        filePath,
+      ],
+      {
+        maxBuffer: 2 * 1024 * 1024,
+        timeout: 30_000,
+        windowsHide: true,
+      }
+    );
+
+  const data = JSON.parse(stdout);
+
+  const streams = Array.isArray(data.streams)
+    ? data.streams
+    : [];
+
+  const videoStream = streams.find(
+    (stream: {
+      codec_type?: string;
+    }) =>
+      stream.codec_type === "video"
+  );
+
+  const audioStream = streams.find(
+    (stream: {
+      codec_type?: string;
+    }) =>
+      stream.codec_type === "audio"
+  );
+
+  return {
+    videoCodec:
+      videoStream?.codec_name ?? null,
+    audioCodec:
+      audioStream?.codec_name ?? null,
+  };
+}
+
+async function normalizeVideoToCompatibleMp4(
+  inputPath: string,
+  outputPath: string
+): Promise<void> {
+  const probe = await probeMedia(inputPath);
+
+  const videoIsCompatible =
+    probe.videoCodec === "h264";
+
+  const audioIsCompatible =
+    probe.audioCodec === "aac";
+
+  if (
+    videoIsCompatible &&
+    audioIsCompatible
+  ) {
+    await fs.rename(
+      inputPath,
+      outputPath
+    );
+
+    return;
+  }
+
+  const ffmpegArgs = [
+    "-y",
+    "-i",
+    inputPath,
+
+    "-map",
+    "0:v:0",
+
+    "-map",
+    "0:a:0?",
+
+    "-movflags",
+    "+faststart",
+  ];
+
+  if (videoIsCompatible) {
+    ffmpegArgs.push(
+      "-c:v",
+      "copy"
+    );
+  } else {
+    ffmpegArgs.push(
+      "-c:v",
+      "libx264",
+      "-preset",
+      "veryfast",
+      "-crf",
+      "23",
+      "-pix_fmt",
+      "yuv420p"
+    );
+  }
+
+  if (audioIsCompatible) {
+    ffmpegArgs.push(
+      "-c:a",
+      "copy"
+    );
+  } else {
+    ffmpegArgs.push(
+      "-c:a",
+      "aac",
+      "-b:a",
+      "192k"
+    );
+  }
+
+  ffmpegArgs.push(
+    outputPath
+  );
+
+  await execFileAsync(
+    FFMPEG_PATH,
+    ffmpegArgs,
+    {
+      maxBuffer: 10 * 1024 * 1024,
+      timeout: 5 * 60 * 1000,
+      windowsHide: true,
+    }
+  );
+
+  await fs.rm(
+    inputPath,
+    {
+      force: true,
+    }
+  );
+}
+
+async function convertAudioToMp3(
+  inputPath: string,
+  outputPath: string
+): Promise<void> {
+  await execFileAsync(
+    FFMPEG_PATH,
+    [
+      "-y",
+      "-i",
+      inputPath,
+      "-vn",
+      "-c:a",
+      "libmp3lame",
+      "-b:a",
+      "192k",
+      "-ar",
+      "44100",
+      "-ac",
+      "2",
+      outputPath,
+    ],
+    {
+      maxBuffer: 10 * 1024 * 1024,
+      timeout: 5 * 60 * 1000,
+      windowsHide: true,
+    }
+  );
+}
+
 export async function downloadMedia({
   url,
   formatId,
   type,
 }: DownloadOptions): Promise<DownloadResult> {
-  const tempDir = createTempDirectory();
+  const tempDir =
+    createTempDirectory();
 
-  await fs.mkdir(tempDir, {
-    recursive: true,
-  });
+  await fs.mkdir(
+    tempDir,
+    {
+      recursive: true,
+    }
+  );
 
   try {
-    const outputTemplate = path.join(
-      tempDir,
-      "%(title)s.%(ext)s"
-    );
+    const outputTemplate =
+      path.join(
+        tempDir,
+        "%(title)s.%(ext)s"
+      );
 
-    /*
-     * AUDIO DOWNLOAD
-     */
     if (type === "audio") {
-      await execFileAsync(
-        "python",
+      await runYtDlp(
         [
-          "-m",
-          "yt_dlp",
           "--no-playlist",
           "-f",
           formatId,
-          "--extract-audio",
-          "--audio-format",
-          "mp3",
-          "--audio-quality",
-          "192K",
-          "--ffmpeg-location",
-          FFMPEG_PATH,
           "-o",
           outputTemplate,
           url,
         ],
-        {
-          maxBuffer: 10 * 1024 * 1024,
-          timeout: 5 * 60 * 1000,
-          windowsHide: true,
-        }
+        5 * 60 * 1000
       );
 
-      const files = await fs.readdir(
-        tempDir
+      const sourceFile = await findDownloadedMedia(
+        tempDir,
+        [
+          ".mp3",
+          ".m4a",
+          ".webm",
+          ".mp4",
+          ".opus",
+          ".aac",
+        ]
       );
 
-      const audioFile = files.find(
-        (file) =>
-          file.toLowerCase().endsWith(".mp3")
-      );
-
-      if (!audioFile) {
+      if (!sourceFile) {
         throw new DownloadError(
-          "SaveFlow could not create the requested audio file.",
+          "SaveFlow could not find the downloaded audio file.",
           500
         );
       }
 
-      const audioPath = path.join(
+      const baseName = sanitizeFileName(
+        path.parse(sourceFile).name
+      );
+
+      /*
+       * If yt-dlp already produced MP3,
+       * use it directly.
+       *
+       * TikTok's "audio" format does exactly this.
+       */
+      if (
+        path.extname(sourceFile).toLowerCase() === ".mp3"
+      ) {
+        await validateActualFileSize(sourceFile);
+
+        const finalPath = path.join(
+          tempDir,
+          `${baseName}.mp3`
+        );
+
+        if (sourceFile !== finalPath) {
+          await fs.rename(
+            sourceFile,
+            finalPath
+          );
+        }
+
+        return {
+          filePath: finalPath,
+          fileName: `${baseName}.mp3`,
+          contentType: "audio/mpeg",
+        };
+      }
+
+      /*
+       * Other audio containers need conversion
+       * to MP3.
+       */
+      const outputPath = path.join(
         tempDir,
-        audioFile
+        `${baseName}.mp3`
+      );
+
+      await convertAudioToMp3(
+        sourceFile,
+        outputPath
       );
 
       await validateActualFileSize(
-        audioPath
+        outputPath
       );
 
-      const safeName =
-        sanitizeFileName(
-          path.parse(audioFile).name
-        );
-
       return {
-        filePath: audioPath,
-        fileName: `${safeName}.mp3`,
+        filePath: outputPath,
+        fileName: `${baseName}.mp3`,
         contentType: "audio/mpeg",
       };
     }
 
-    /*
-     * VIDEO DOWNLOAD
-     *
-     * Download the selected video format
-     * together with the best available audio.
-     *
-     * Then use FFmpeg to create a browser
-     * compatible MP4 containing:
-     *
-     * Video: H.264
-     * Audio: AAC
-     * Container: MP4
-     */
-    await execFileAsync(
-      "python",
+    await runYtDlp(
       [
-        "-m",
-        "yt_dlp",
-
         "--no-playlist",
 
         "-f",
         `${formatId}+bestaudio/best`,
 
-        /*
-         * Force MP4 as the final container.
-         */
         "--merge-output-format",
-        "mp4",
-
-        /*
-         * Convert/remux the result to MP4.
-         */
-        "--remux-video",
-        "mp4",
-
-        /*
-         * Encode to codecs supported by
-         * modern browsers and media players.
-         */
-        "--postprocessor-args",
-        "Merger+ffmpeg:-c:v libx264 -c:a aac -b:a 192k",
-
-        /*
-         * FFmpeg location.
-         */
-        "--ffmpeg-location",
-        FFMPEG_PATH,
+        "mkv",
 
         "-o",
         outputTemplate,
 
         url,
       ],
-      {
-        maxBuffer: 10 * 1024 * 1024,
-        timeout: 5 * 60 * 1000,
-        windowsHide: true,
-      }
+      5 * 60 * 1000
     );
 
-    const files = await fs.readdir(
-      tempDir
-    );
+    const sourceFile =
+      await findDownloadedMedia(
+        tempDir,
+        [
+          ".mkv",
+          ".mp4",
+          ".webm",
+          ".mov",
+        ]
+      );
 
-    const videoFile = files.find(
-      (file) =>
-        file.toLowerCase().endsWith(".mp4")
-    );
-
-    if (!videoFile) {
+    if (!sourceFile) {
       throw new DownloadError(
-        "SaveFlow could not create the requested video file.",
+        "SaveFlow could not find the downloaded video file.",
         500
       );
     }
 
-    const videoPath = path.join(
-      tempDir,
-      videoFile
+    const baseName =
+      sanitizeFileName(
+        path.parse(sourceFile).name
+      );
+
+    const outputPath =
+      path.join(
+        tempDir,
+        `${baseName}.mp4`
+      );
+
+    await normalizeVideoToCompatibleMp4(
+      sourceFile,
+      outputPath
     );
 
     await validateActualFileSize(
-      videoPath
+      outputPath
     );
 
-    const safeName =
-      sanitizeFileName(
-        path.parse(videoFile).name
-      );
-
     return {
-      filePath: videoPath,
-      fileName: `${safeName}.mp4`,
+      filePath: outputPath,
+      fileName: `${baseName}.mp4`,
       contentType: "video/mp4",
     };
   } catch (error) {
-    await fs.rm(tempDir, {
-      recursive: true,
-      force: true,
-    });
+    await fs.rm(
+      tempDir,
+      {
+        recursive: true,
+        force: true,
+      }
+    );
 
     throw translateDownloadError(
       error
@@ -404,10 +656,13 @@ export async function cleanupDownload(
   const tempDir =
     path.dirname(filePath);
 
-  await fs.rm(tempDir, {
-    recursive: true,
-    force: true,
-  });
+  await fs.rm(
+    tempDir,
+    {
+      recursive: true,
+      force: true,
+    }
+  );
 }
 
 export function isValidFormatId(
