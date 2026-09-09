@@ -15,6 +15,17 @@ const FACEBOOK_HOSTNAMES = new Set([
   "web.facebook.com",
 ]);
 
+const FACEBOOK_USER_AGENTS = [
+  // Normal desktop browser
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+
+  // Facebook crawler
+  "facebookexternalhit/1.1",
+
+  // Mobile browser
+  "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36",
+];
+
 function isPrivateIPv4(ip: string): boolean {
   const parts = ip.split(".").map(Number);
 
@@ -231,223 +242,511 @@ function isFacebookShareUrl(
   );
 }
 
-/**
- * Facebook sometimes redirects:
- *
- * /share/r/ABC123/
- *
- * to:
- *
- * /login/?next=https%3A%2F%2Fwww.facebook.com%2Fshare%2Fr%2FABC123%2F
- *
- * We must NOT pass that login URL to yt-dlp.
- *
- * Instead, recover the URL contained in the `next`
- * parameter and return the original Facebook share
- * URL so yt-dlp can attempt to handle it.
- */
-function recoverFacebookShareUrlFromLogin(
+function isFacebookMediaUrl(
   url: URL
-): URL | null {
+): boolean {
   if (
     !isFacebookHostname(
       url.hostname
     )
   ) {
-    return null;
+    return false;
   }
 
-  if (
-    url.pathname !== "/login/" &&
-    url.pathname !== "/login"
-  ) {
-    return null;
-  }
+  const pathname =
+    url.pathname.toLowerCase();
 
-  const next = url.searchParams.get(
-    "next"
+  return (
+    pathname.startsWith("/reel/") ||
+    pathname.startsWith("/watch") ||
+    pathname.includes("/videos/")
+  );
+}
+
+function buildFacebookReelUrl(
+  id: string,
+  hostname = "www.facebook.com"
+): URL {
+  return new URL(
+    `https://${hostname}/reel/${id}`
+  );
+}
+
+function buildFacebookWatchUrl(
+  id: string,
+  hostname = "www.facebook.com"
+): URL {
+  return new URL(
+    `https://${hostname}/watch/?v=${id}`
+  );
+}
+
+function extractFacebookMediaUrl(
+  value: string
+): URL | null {
+  /*
+   * Look for canonical Facebook Reel URLs.
+   *
+   * Example:
+   * https://www.facebook.com/reel/123456789/
+   */
+  const reelMatch = value.match(
+    /https?:\/\/(?:www\.|m\.|web\.)?facebook\.com\/reel\/(\d+)/i
   );
 
-  if (!next) {
-    return null;
+  if (reelMatch?.[1]) {
+    return buildFacebookReelUrl(
+      reelMatch[1]
+    );
   }
 
-  let nextUrl: URL;
+  /*
+   * Look for Facebook watch URLs.
+   *
+   * Example:
+   * https://www.facebook.com/watch/?v=123456789
+   */
+  const watchMatch = value.match(
+    /https?:\/\/(?:www\.|m\.|web\.)?facebook\.com\/watch\/?(?:\?[^"'<>]*?\bv=)(\d+)/i
+  );
+
+  if (watchMatch?.[1]) {
+    return buildFacebookWatchUrl(
+      watchMatch[1]
+    );
+  }
+
+  /*
+   * Look for Facebook /videos/<id> URLs.
+   */
+  const videosMatch = value.match(
+    /https?:\/\/(?:www\.|m\.|web\.)?facebook\.com\/[^"'<>\/\s]+\/videos\/(\d+)/i
+  );
+
+  if (videosMatch?.[1]) {
+    return new URL(
+      `https://www.facebook.com/watch/?v=${videosMatch[1]}`
+    );
+  }
+
+  return null;
+}
+
+function extractFacebookMediaId(
+  value: string
+): URL | null {
+  /*
+   * Handle URLs where Facebook gives us a
+   * relative destination instead of an absolute URL.
+   */
+
+  const reelMatch = value.match(
+    /\/reel\/(\d+)/i
+  );
+
+  if (reelMatch?.[1]) {
+    return buildFacebookReelUrl(
+      reelMatch[1]
+    );
+  }
+
+  const watchMatch = value.match(
+    /\/watch\/?(?:\?[^"'<>]*?\bv=)(\d+)/i
+  );
+
+  if (watchMatch?.[1]) {
+    return buildFacebookWatchUrl(
+      watchMatch[1]
+    );
+  }
+
+  const videosMatch = value.match(
+    /\/videos\/(\d+)/i
+  );
+
+  if (videosMatch?.[1]) {
+    return new URL(
+      `https://www.facebook.com/watch/?v=${videosMatch[1]}`
+    );
+  }
+
+  return null;
+}
+
+function extractCanonicalFromHtml(
+  html: string
+): URL | null {
+  /*
+   * Facebook frequently exposes canonical URLs
+   * through:
+   *
+   * <link rel="canonical" href="...">
+   *
+   * or Open Graph:
+   *
+   * <meta property="og:url" content="...">
+   */
+
+  const canonicalPatterns = [
+    /<link[^>]+rel=["']canonical["'][^>]+href=["']([^"']+)["']/i,
+
+    /<link[^>]+href=["']([^"']+)["'][^>]+rel=["']canonical["']/i,
+
+    /<meta[^>]+property=["']og:url["'][^>]+content=["']([^"']+)["']/i,
+
+    /<meta[^>]+content=["']([^"']+)["'][^>]+property=["']og:url["']/i,
+  ];
+
+  for (const pattern of canonicalPatterns) {
+    const match = html.match(pattern);
+
+    if (!match?.[1]) {
+      continue;
+    }
+
+    const mediaUrl =
+      extractFacebookMediaUrl(
+        match[1]
+      );
+
+    if (mediaUrl) {
+      return mediaUrl;
+    }
+
+    const mediaIdUrl =
+      extractFacebookMediaId(
+        match[1]
+      );
+
+    if (mediaIdUrl) {
+      return mediaIdUrl;
+    }
+  }
+
+  /*
+   * Fallback: scan the HTML directly for
+   * Facebook Reel URLs.
+   */
+  const directMedia =
+    extractFacebookMediaUrl(
+      html
+    );
+
+  if (directMedia) {
+    return directMedia;
+  }
+
+  const directMediaId =
+    extractFacebookMediaId(
+      html
+    );
+
+  if (directMediaId) {
+    return directMediaId;
+  }
+
+  return null;
+}
+
+function extractFacebookShareDestination(
+  location: string,
+  baseUrl: URL
+): URL | null {
+  let destination: URL;
 
   try {
-    nextUrl = new URL(next);
+    destination =
+      new URL(
+        location,
+        baseUrl
+      );
   } catch {
     return null;
   }
 
   if (
     !["http:", "https:"].includes(
-      nextUrl.protocol
+      destination.protocol
     )
   ) {
     return null;
   }
 
   if (
-    nextUrl.username ||
-    nextUrl.password
+    destination.username ||
+    destination.password
   ) {
     return null;
   }
 
   if (
     !isFacebookHostname(
-      nextUrl.hostname
+      destination.hostname
     )
   ) {
     return null;
   }
 
+  /*
+   * Best case:
+   *
+   * /share/r/ABC
+   *      ↓
+   * /reel/123456789
+   */
   if (
-    !isFacebookShareUrl(nextUrl)
+    isFacebookMediaUrl(
+      destination
+    )
   ) {
-    return null;
+    return destination;
   }
 
-  return nextUrl;
+  /*
+   * Sometimes the redirect itself is a login URL
+   * containing the original share URL in `next`.
+   *
+   * Do NOT pass the login URL to yt-dlp.
+   */
+  if (
+    destination.pathname ===
+      "/login" ||
+    destination.pathname ===
+      "/login/"
+  ) {
+    const next =
+      destination.searchParams.get(
+        "next"
+      );
+
+    if (next) {
+      try {
+        const nextUrl =
+          new URL(next);
+
+        if (
+          isFacebookMediaUrl(
+            nextUrl
+          )
+        ) {
+          return nextUrl;
+        }
+      } catch {
+        // Ignore malformed next parameter.
+      }
+    }
+  }
+
+  /*
+   * Even if the destination isn't canonical,
+   * inspect the URL itself for a media ID.
+   */
+  const mediaUrl =
+    extractFacebookMediaId(
+      destination.toString()
+    );
+
+  if (mediaUrl) {
+    return mediaUrl;
+  }
+
+  return null;
+}
+
+async function fetchFacebookPage(
+  url: URL,
+  userAgent: string
+): Promise<{
+  response: Response;
+  html: string;
+}> {
+  const response = await fetch(
+    url.toString(),
+    {
+      method: "GET",
+      redirect: "manual",
+      headers: {
+        "User-Agent": userAgent,
+
+        Accept:
+          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+
+        "Accept-Language":
+          "en-US,en;q=0.9",
+
+        "Cache-Control":
+          "no-cache",
+
+        Pragma:
+          "no-cache",
+      },
+
+      signal:
+        AbortSignal.timeout(
+          10_000
+        ),
+    }
+  );
+
+  let html = "";
+
+  /*
+   * Only read HTML responses.
+   */
+  const contentType =
+    response.headers.get(
+      "content-type"
+    ) ?? "";
+
+  if (
+    contentType.includes(
+      "text/html"
+    ) ||
+    contentType.includes(
+      "application/xhtml+xml"
+    )
+  ) {
+    try {
+      html =
+        await response.text();
+    } catch {
+      html = "";
+    }
+  }
+
+  return {
+    response,
+    html,
+  };
 }
 
 async function resolveFacebookShareUrl(
   url: URL
 ): Promise<URL> {
-  /*
-   * Only resolve Facebook share URLs.
-   *
-   * This prevents arbitrary URLs from being
-   * followed as part of URL normalization.
-   */
   if (!isFacebookShareUrl(url)) {
     return url;
   }
 
-  let response: Response;
-
-  try {
-    response = await fetch(
-      url.toString(),
-      {
-        method: "GET",
-        redirect: "manual",
-        headers: {
-          "User-Agent":
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0 Safari/537.36",
-          Accept:
-            "text/html,application/xhtml+xml",
-        },
-        signal:
-          AbortSignal.timeout(
-            10_000
-          ),
-      }
-    );
-  } catch {
-    /*
-     * If Facebook itself cannot be reached,
-     * leave the original URL for yt-dlp.
-     */
-    return url;
-  }
-
-  const location =
-    response.headers.get(
-      "location"
-    );
-
   /*
-   * Facebook may respond with a redirect.
-   */
-  if (location) {
-    let redirectedUrl: URL;
-
-    try {
-      redirectedUrl =
-        new URL(
-          location,
-          url
-        );
-    } catch {
-      throw new Error(
-        "Facebook returned an invalid redirect URL."
-      );
-    }
-
-    if (
-      !["http:", "https:"].includes(
-        redirectedUrl.protocol
-      )
-    ) {
-      throw new Error(
-        "Facebook returned an unsupported redirect URL."
-      );
-    }
-
-    if (
-      redirectedUrl.username ||
-      redirectedUrl.password
-    ) {
-      throw new Error(
-        "Facebook returned an unsafe redirect URL."
-      );
-    }
-
-    /*
-     * Only allow Facebook destinations.
-     *
-     * This prevents the share URL from being
-     * abused as an open redirect / SSRF proxy.
-     */
-    if (
-      !isFacebookHostname(
-        redirectedUrl.hostname
-      )
-    ) {
-      throw new Error(
-        "Facebook returned an unsupported redirect destination."
-      );
-    }
-
-    await validateHostname(
-      redirectedUrl.hostname
-    );
-
-    /*
-     * IMPORTANT:
-     *
-     * If Facebook redirected us to:
-     *
-     * /login/?next=<original-share-url>
-     *
-     * don't return the login URL.
-     *
-     * Recover the original share URL instead.
-     */
-    const recoveredShareUrl =
-      recoverFacebookShareUrlFromLogin(
-        redirectedUrl
-      );
-
-    if (recoveredShareUrl) {
-      return recoveredShareUrl;
-    }
-
-    /*
-     * If this is a real Facebook destination
-     * such as /reel/123456, return it normally.
-     */
-    return redirectedUrl;
-  }
-
-  /*
-   * Some Facebook share URLs may return the
-   * destination without a normal HTTP redirect.
+   * Try the original Facebook host first,
+   * then mobile and web Facebook hosts.
    *
-   * Leave the original URL intact and allow
-   * yt-dlp to handle it.
+   * Different Facebook hosts can receive
+   * different redirect behavior.
+   */
+  const candidateUrls = [
+    url,
+    new URL(
+      url.toString().replace(
+        /^https?:\/\/www\.facebook\.com/i,
+        "https://m.facebook.com"
+      )
+    ),
+    new URL(
+      url.toString().replace(
+        /^https?:\/\/www\.facebook\.com/i,
+        "https://web.facebook.com"
+      )
+    ),
+  ];
+
+  /*
+   * Remove duplicate URLs.
+   */
+  const uniqueCandidates =
+    Array.from(
+      new Map(
+        candidateUrls.map(
+          (candidate) => [
+            candidate.toString(),
+            candidate,
+          ]
+        )
+      ).values()
+    );
+
+  for (const candidate of uniqueCandidates) {
+    await validateHostname(
+      candidate.hostname
+    );
+
+    for (const userAgent of FACEBOOK_USER_AGENTS) {
+      let result: {
+        response: Response;
+        html: string;
+      };
+
+      try {
+        result =
+          await fetchFacebookPage(
+            candidate,
+            userAgent
+          );
+      } catch {
+        continue;
+      }
+
+      const {
+        response,
+        html,
+      } = result;
+
+      /*
+       * FIRST:
+       * Inspect the Location header.
+       */
+      const location =
+        response.headers.get(
+          "location"
+        );
+
+      if (location) {
+        const destination =
+          extractFacebookShareDestination(
+            location,
+            candidate
+          );
+
+        if (destination) {
+          await validateHostname(
+            destination.hostname
+          );
+
+          return destination;
+        }
+      }
+
+      /*
+       * SECOND:
+       * Inspect the returned HTML.
+       *
+       * This catches cases where Facebook doesn't
+       * provide a normal HTTP redirect.
+       */
+      if (html) {
+        const htmlMediaUrl =
+          extractCanonicalFromHtml(
+            html
+          );
+
+        if (htmlMediaUrl) {
+          await validateHostname(
+            htmlMediaUrl.hostname
+          );
+
+          return htmlMediaUrl;
+        }
+      }
+    }
+  }
+
+  /*
+   * If Facebook gives us a login page with no
+   * canonical media URL, we cannot safely invent
+   * the Reel ID.
+   *
+   * Return the original share URL and let yt-dlp
+   * attempt its own extractor behavior.
    */
   return url;
 }
@@ -500,16 +799,15 @@ export async function validateMediaUrl(
   }
 
   /*
-   * Validate the original hostname before doing
-   * any redirect resolution.
+   * Validate the original hostname before
+   * attempting Facebook resolution.
    */
   await validateHostname(
     parsedUrl.hostname
   );
 
   /*
-   * Facebook share URLs are resolved to their
-   * actual Facebook media URL when possible.
+   * Resolve Facebook share URLs ourselves.
    */
   const resolvedUrl =
     await resolveFacebookShareUrl(
@@ -519,9 +817,8 @@ export async function validateMediaUrl(
   /*
    * Validate the final URL again.
    *
-   * This is important because the destination
-   * must receive the same SSRF protection as
-   * the original URL.
+   * This preserves the SSRF boundary even
+   * after redirect resolution.
    */
   await validateHostname(
     resolvedUrl.hostname
