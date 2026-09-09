@@ -207,6 +207,15 @@ export async function getMediaInfo(
           "--remote-components",
           "ejs:npm",
 
+          /*
+           * Use the BgUtils PO Token provider.
+           *
+           * The provider is built into the production
+           * Docker image at this location.
+           */
+          "--extractor-args",
+          "youtubepot-bgutilscript:server_home=/opt/bgutil-ytdlp-pot-provider/server",
+
           url,
         ],
         {
