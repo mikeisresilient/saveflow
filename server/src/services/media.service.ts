@@ -184,468 +184,263 @@ function extractFacebookMediaUrl(
 async function resolveFacebookShareUrl(
   url: URL
 ): Promise<URL> {
-  /*
-   * Only Facebook share URLs need special
-   * handling.
-   */
-  if (
-    !isFacebookShareUrl(url)
-  ) {
+  if (!isFacebookShareUrl(url)) {
     return url;
   }
 
-  /*
-   * The important part:
-   *
-   * Facebook's HEAD request gives us the
-   * canonical Reel URL.
-   *
-   * We verified this behavior with:
-   *
-   * curl -I -L
-   *
-   * which returned:
-   *
-   * /share/r/1BX6cVVLjm/
-   *
-   * ->
-   *
-   * /reel/1045549397960163/
-   */
+  console.log(
+    "Resolving Facebook share URL:",
+    url.toString()
+  );
 
-  const candidates = [
-    url,
-    new URL(
-      url.toString().replace(
-        /^https?:\/\/www\.facebook\.com/i,
-        "https://m.facebook.com"
-      )
-    ),
-    new URL(
-      url.toString().replace(
-        /^https?:\/\/www\.facebook\.com/i,
-        "https://web.facebook.com"
-      )
-    ),
-  ];
+  try {
+    /*
+     * Facebook reliably exposes the canonical Reel
+     * through the first HTTP redirect.
+     *
+     * We intentionally DO NOT use -L here because
+     * we want the first Location header, not the
+     * final page after Facebook redirects further.
+     *
+     * This matches the curl test we already performed:
+     *
+     * /share/r/1BX6cVVLjm/
+     *
+     * ->
+     *
+     * /reel/1045549397960163/
+     */
+    const { stdout } =
+      await execFileAsync(
+        "curl",
+        [
+          "-sS",
 
-  const uniqueCandidates =
-    Array.from(
-      new Map(
-        candidates.map(
-          (candidate) => [
-            candidate.toString(),
-            candidate,
-          ]
-        )
-      ).values()
+          "-I",
+
+          "--max-redirs",
+          "0",
+
+          "--connect-timeout",
+          "10",
+
+          "--max-time",
+          "15",
+
+          "-A",
+          "curl/8.0.0",
+
+          url.toString(),
+        ],
+        {
+          maxBuffer:
+            2 * 1024 * 1024,
+
+          timeout:
+            20_000,
+
+          windowsHide:
+            true,
+        }
+      );
+
+    console.log(
+      "Facebook redirect headers:",
+      stdout
     );
 
-  for (
-    const candidate
-    of uniqueCandidates
-  ) {
+    /*
+     * HTTP header names are case-insensitive.
+     *
+     * Extract the first Location header.
+     */
+    const locationMatch =
+      stdout.match(
+        /^location:\s*(.+)$/im
+      );
+
+    if (!locationMatch?.[1]) {
+      console.log(
+        "Facebook share URL did not return a Location header."
+      );
+
+      return url;
+    }
+
+    const location =
+      locationMatch[1].trim();
+
+    console.log(
+      "Facebook redirect location:",
+      location
+    );
+
+    let redirectedUrl: URL;
+
     try {
-      /*
-       * HEAD is intentional.
-       *
-       * Facebook gave the canonical Reel
-       * location when tested with curl -I.
-       */
-      const response =
-        await fetch(
-          candidate.toString(),
-          {
-            method: "HEAD",
-
-            /*
-             * Do NOT follow the redirect.
-             *
-             * We need the Location header.
-             */
-            redirect: "manual",
-
-            headers: {
-              "User-Agent":
-                "curl/8.0.0",
-
-              Accept:
-                "*/*",
-            },
-
-            signal:
-              AbortSignal.timeout(
-                10_000
-              ),
-          }
+      redirectedUrl =
+        new URL(
+          location,
+          url
         );
+    } catch {
+      console.error(
+        "Facebook returned an invalid redirect URL."
+      );
 
-      const location =
-        response.headers.get(
-          "location"
-        );
+      return url;
+    }
 
-      if (!location) {
-        continue;
-      }
+    /*
+     * Security:
+     *
+     * Only HTTP/HTTPS redirects are accepted.
+     */
+    if (
+      !["http:", "https:"].includes(
+        redirectedUrl.protocol
+      )
+    ) {
+      console.error(
+        "Facebook returned a non-HTTP redirect."
+      );
 
-      let redirectedUrl: URL;
+      return url;
+    }
 
-      try {
-        redirectedUrl =
-          new URL(
-            location,
-            candidate
-          );
-      } catch {
-        continue;
-      }
+    /*
+     * Security:
+     *
+     * Never follow redirects containing
+     * embedded credentials.
+     */
+    if (
+      redirectedUrl.username ||
+      redirectedUrl.password
+    ) {
+      console.error(
+        "Facebook returned a redirect containing credentials."
+      );
 
-      /*
-       * Security boundary:
-       *
-       * Only HTTP/HTTPS is allowed.
-       */
-      if (
-        !["http:", "https:"].includes(
-          redirectedUrl.protocol
-        )
-      ) {
-        continue;
-      }
+      return url;
+    }
 
-      /*
-       * Never allow credentials.
-       */
-      if (
-        redirectedUrl.username ||
-        redirectedUrl.password
-      ) {
-        continue;
-      }
+    /*
+     * Security:
+     *
+     * The share URL must resolve to Facebook.
+     * Do not allow Facebook's redirect mechanism
+     * to turn this into an arbitrary external URL.
+     */
+    if (
+      !isFacebookHostname(
+        redirectedUrl.hostname
+      )
+    ) {
+      console.error(
+        "Facebook share URL redirected to an unexpected host:",
+        redirectedUrl.hostname
+      );
 
-      /*
-       * Never allow Facebook to turn this into
-       * an arbitrary external redirect.
-       */
-      if (
-        !isFacebookHostname(
-          redirectedUrl.hostname
-        )
-      ) {
-        continue;
-      }
+      return url;
+    }
 
-      /*
-       * Direct canonical media URL.
-       *
-       * Example:
-       *
-       * https://www.facebook.com/reel/1045549397960163/
-       */
-      if (
-        isFacebookMediaUrl(
-          redirectedUrl
-        )
-      ) {
-        /*
-         * Run our existing SSRF validation
-         * against the resolved URL.
-         */
-        const validated =
-          await validateMediaUrl(
-            redirectedUrl.toString()
-          );
-
-        return validated;
-      }
-
-      /*
-       * Sometimes the redirect URL contains
-       * a media ID even if its path isn't one
-       * of our known canonical paths.
-       */
-      const extracted =
-        extractFacebookMediaUrl(
+    /*
+     * If Facebook gave us the Reel directly,
+     * use it.
+     */
+    if (
+      isFacebookMediaUrl(
+        redirectedUrl
+      )
+    ) {
+      const validated =
+        await validateMediaUrl(
           redirectedUrl.toString()
         );
 
-      if (extracted) {
-        const validated =
-          await validateMediaUrl(
-            extracted.toString()
-          );
+      console.log(
+        "Resolved Facebook media URL:",
+        validated.toString()
+      );
 
-        return validated;
-      }
-
-      /*
-       * Handle:
-       *
-       * /login/?next=https://facebook.com/reel/123
-       *
-       * This is not expected to be necessary for
-       * the HEAD behavior we verified, but keeping
-       * this fallback makes the resolver more robust.
-       */
-      if (
-        redirectedUrl.pathname ===
-          "/login" ||
-        redirectedUrl.pathname ===
-          "/login/"
-      ) {
-        const next =
-          redirectedUrl.searchParams.get(
-            "next"
-          );
-
-        if (next) {
-          const nextMedia =
-            extractFacebookMediaUrl(
-              next
-            );
-
-          if (nextMedia) {
-            const validated =
-              await validateMediaUrl(
-                nextMedia.toString()
-              );
-
-            return validated;
-          }
-        }
-      }
-    } catch {
-      /*
-       * Try the next Facebook hostname.
-       */
-      continue;
+      return validated;
     }
-  }
 
-  /*
-   * If HEAD did not resolve the URL, try GET
-   * as a fallback.
-   */
-  for (
-    const candidate
-    of uniqueCandidates
-  ) {
-    try {
-      const response =
-        await fetch(
-          candidate.toString(),
-          {
-            method: "GET",
-            redirect: "manual",
+    /*
+     * Some Facebook redirects may contain a
+     * recognizable Reel/Watch URL inside them.
+     */
+    const extracted =
+      extractFacebookMediaUrl(
+        redirectedUrl.toString()
+      );
 
-            headers: {
-              "User-Agent":
-                "curl/8.0.0",
-
-              Accept:
-                "text/html,application/xhtml+xml,*/*;q=0.8",
-            },
-
-            signal:
-              AbortSignal.timeout(
-                10_000
-              ),
-          }
+    if (extracted) {
+      const validated =
+        await validateMediaUrl(
+          extracted.toString()
         );
 
-      const location =
-        response.headers.get(
-          "location"
+      console.log(
+        "Extracted Facebook media URL:",
+        validated.toString()
+      );
+
+      return validated;
+    }
+
+    /*
+     * Handle a Facebook login redirect containing
+     * a `next=` parameter.
+     */
+    if (
+      redirectedUrl.pathname ===
+        "/login" ||
+      redirectedUrl.pathname ===
+        "/login/"
+    ) {
+      const next =
+        redirectedUrl.searchParams.get(
+          "next"
         );
 
-      if (location) {
-        let redirectedUrl: URL;
-
-        try {
-          redirectedUrl =
-            new URL(
-              location,
-              candidate
-            );
-        } catch {
-          continue;
-        }
-
-        if (
-          !isFacebookHostname(
-            redirectedUrl.hostname
-          )
-        ) {
-          continue;
-        }
-
-        if (
-          !["http:", "https:"].includes(
-            redirectedUrl.protocol
-          )
-        ) {
-          continue;
-        }
-
-        if (
-          redirectedUrl.username ||
-          redirectedUrl.password
-        ) {
-          continue;
-        }
-
-        /*
-         * Direct Reel destination.
-         */
-        if (
-          isFacebookMediaUrl(
-            redirectedUrl
-          )
-        ) {
-          const validated =
-            await validateMediaUrl(
-              redirectedUrl.toString()
-            );
-
-          return validated;
-        }
-
-        /*
-         * Extract media ID from redirect.
-         */
-        const extracted =
+      if (next) {
+        const nextMedia =
           extractFacebookMediaUrl(
-            redirectedUrl.toString()
+            next
           );
 
-        if (extracted) {
+        if (nextMedia) {
           const validated =
             await validateMediaUrl(
-              extracted.toString()
+              nextMedia.toString()
             );
 
-          return validated;
-        }
-
-        /*
-         * Handle login/?next=...
-         */
-        if (
-          redirectedUrl.pathname ===
-            "/login" ||
-          redirectedUrl.pathname ===
-            "/login/"
-        ) {
-          const next =
-            redirectedUrl.searchParams.get(
-              "next"
-            );
-
-          if (next) {
-            const nextMedia =
-              extractFacebookMediaUrl(
-                next
-              );
-
-            if (nextMedia) {
-              const validated =
-                await validateMediaUrl(
-                  nextMedia.toString()
-                );
-
-              return validated;
-            }
-          }
-        }
-      }
-
-      /*
-       * If Facebook returned HTML, inspect
-       * canonical/Open Graph URLs.
-       */
-      const contentType =
-        response.headers.get(
-          "content-type"
-        ) ?? "";
-
-      if (
-        contentType.includes(
-          "text/html"
-        ) ||
-        contentType.includes(
-          "application/xhtml+xml"
-        )
-      ) {
-        const html =
-          await response.text();
-
-        const patterns = [
-          /<link[^>]+rel=["']canonical["'][^>]+href=["']([^"']+)["']/i,
-
-          /<link[^>]+href=["']([^"']+)["'][^>]+rel=["']canonical["']/i,
-
-          /<meta[^>]+property=["']og:url["'][^>]+content=["']([^"']+)["']/i,
-
-          /<meta[^>]+content=["']([^"']+)["'][^>]+property=["']og:url["']/i,
-        ];
-
-        for (
-          const pattern
-          of patterns
-        ) {
-          const match =
-            html.match(pattern);
-
-          if (!match?.[1]) {
-            continue;
-          }
-
-          const mediaUrl =
-            extractFacebookMediaUrl(
-              match[1]
-            );
-
-          if (mediaUrl) {
-            const validated =
-              await validateMediaUrl(
-                mediaUrl.toString()
-              );
-
-            return validated;
-          }
-        }
-
-        /*
-         * Last HTML fallback: search the entire
-         * response for a Facebook Reel URL.
-         */
-        const mediaUrl =
-          extractFacebookMediaUrl(
-            html
+          console.log(
+            "Resolved Facebook login redirect:",
+            validated.toString()
           );
-
-        if (mediaUrl) {
-          const validated =
-            await validateMediaUrl(
-              mediaUrl.toString()
-            );
 
           return validated;
         }
       }
-    } catch {
-      continue;
     }
-  }
 
-  /*
-   * No canonical destination was found.
-   *
-   * Return the original URL so yt-dlp can make
-   * its own attempt.
-   */
-  return url;
+    console.log(
+      "Facebook redirect was not recognized:",
+      redirectedUrl.toString()
+    );
+
+    return url;
+  } catch (error) {
+    console.error(
+      "Facebook share URL resolution failed:",
+      error
+    );
+
+    return url;
+  }
 }
 
 function getFriendlyMediaError(
