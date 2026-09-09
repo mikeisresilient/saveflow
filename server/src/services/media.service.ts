@@ -6,8 +6,20 @@ import {
   RawFormat,
 } from "../utils/format.utils.js";
 
+import {
+  validateMediaUrl,
+} from "../utils/url.utils.js";
+
 const execFileAsync =
   promisify(execFile);
+
+const FACEBOOK_HOSTNAMES =
+  new Set([
+    "facebook.com",
+    "www.facebook.com",
+    "m.facebook.com",
+    "web.facebook.com",
+  ]);
 
 export class MediaInfoError extends Error {
   statusCode: number;
@@ -29,6 +41,611 @@ export class MediaInfoError extends Error {
     this.code =
       code;
   }
+}
+
+function isFacebookHostname(
+  hostname: string
+): boolean {
+  return FACEBOOK_HOSTNAMES.has(
+    hostname.toLowerCase()
+  );
+}
+
+function isFacebookShareUrl(
+  url: URL
+): boolean {
+  if (
+    !isFacebookHostname(
+      url.hostname
+    )
+  ) {
+    return false;
+  }
+
+  const pathname =
+    url.pathname.toLowerCase();
+
+  return (
+    pathname === "/share" ||
+    pathname.startsWith(
+      "/share/"
+    )
+  );
+}
+
+function isFacebookMediaUrl(
+  url: URL
+): boolean {
+  if (
+    !isFacebookHostname(
+      url.hostname
+    )
+  ) {
+    return false;
+  }
+
+  const pathname =
+    url.pathname.toLowerCase();
+
+  return (
+    pathname.startsWith(
+      "/reel/"
+    ) ||
+    pathname.startsWith(
+      "/watch"
+    ) ||
+    pathname.includes(
+      "/videos/"
+    )
+  );
+}
+
+function extractFacebookMediaUrl(
+  value: string
+): URL | null {
+  /*
+   * Facebook Reel
+   *
+   * Example:
+   *
+   * https://www.facebook.com/reel/1045549397960163/
+   */
+  const reelMatch =
+    value.match(
+      /https?:\/\/(?:www\.|m\.|web\.)?facebook\.com\/reel\/(\d+)/i
+    );
+
+  if (reelMatch?.[1]) {
+    return new URL(
+      `https://www.facebook.com/reel/${reelMatch[1]}/`
+    );
+  }
+
+  /*
+   * Facebook Watch
+   *
+   * Example:
+   *
+   * https://www.facebook.com/watch/?v=123456789
+   */
+  const watchMatch =
+    value.match(
+      /https?:\/\/(?:www\.|m\.|web\.)?facebook\.com\/watch\/?(?:\?[^"'<>]*?\bv=)(\d+)/i
+    );
+
+  if (watchMatch?.[1]) {
+    return new URL(
+      `https://www.facebook.com/watch/?v=${watchMatch[1]}`
+    );
+  }
+
+  /*
+   * Facebook video URL.
+   */
+  const videoMatch =
+    value.match(
+      /https?:\/\/(?:www\.|m\.|web\.)?facebook\.com\/[^"'<>\/\s]+\/videos\/(\d+)/i
+    );
+
+  if (videoMatch?.[1]) {
+    return new URL(
+      `https://www.facebook.com/watch/?v=${videoMatch[1]}`
+    );
+  }
+
+  /*
+   * Also handle relative Facebook paths.
+   */
+  const relativeReelMatch =
+    value.match(
+      /\/reel\/(\d+)/i
+    );
+
+  if (relativeReelMatch?.[1]) {
+    return new URL(
+      `https://www.facebook.com/reel/${relativeReelMatch[1]}/`
+    );
+  }
+
+  const relativeWatchMatch =
+    value.match(
+      /\/watch\/?(?:\?[^"'<>]*?\bv=)(\d+)/i
+    );
+
+  if (relativeWatchMatch?.[1]) {
+    return new URL(
+      `https://www.facebook.com/watch/?v=${relativeWatchMatch[1]}`
+    );
+  }
+
+  return null;
+}
+
+async function resolveFacebookShareUrl(
+  url: URL
+): Promise<URL> {
+  /*
+   * Only Facebook share URLs need special
+   * handling.
+   */
+  if (
+    !isFacebookShareUrl(url)
+  ) {
+    return url;
+  }
+
+  /*
+   * The important part:
+   *
+   * Facebook's HEAD request gives us the
+   * canonical Reel URL.
+   *
+   * We verified this behavior with:
+   *
+   * curl -I -L
+   *
+   * which returned:
+   *
+   * /share/r/1BX6cVVLjm/
+   *
+   * ->
+   *
+   * /reel/1045549397960163/
+   */
+
+  const candidates = [
+    url,
+    new URL(
+      url.toString().replace(
+        /^https?:\/\/www\.facebook\.com/i,
+        "https://m.facebook.com"
+      )
+    ),
+    new URL(
+      url.toString().replace(
+        /^https?:\/\/www\.facebook\.com/i,
+        "https://web.facebook.com"
+      )
+    ),
+  ];
+
+  const uniqueCandidates =
+    Array.from(
+      new Map(
+        candidates.map(
+          (candidate) => [
+            candidate.toString(),
+            candidate,
+          ]
+        )
+      ).values()
+    );
+
+  for (
+    const candidate
+    of uniqueCandidates
+  ) {
+    try {
+      /*
+       * HEAD is intentional.
+       *
+       * Facebook gave the canonical Reel
+       * location when tested with curl -I.
+       */
+      const response =
+        await fetch(
+          candidate.toString(),
+          {
+            method: "HEAD",
+
+            /*
+             * Do NOT follow the redirect.
+             *
+             * We need the Location header.
+             */
+            redirect: "manual",
+
+            headers: {
+              "User-Agent":
+                "curl/8.0.0",
+
+              Accept:
+                "*/*",
+            },
+
+            signal:
+              AbortSignal.timeout(
+                10_000
+              ),
+          }
+        );
+
+      const location =
+        response.headers.get(
+          "location"
+        );
+
+      if (!location) {
+        continue;
+      }
+
+      let redirectedUrl: URL;
+
+      try {
+        redirectedUrl =
+          new URL(
+            location,
+            candidate
+          );
+      } catch {
+        continue;
+      }
+
+      /*
+       * Security boundary:
+       *
+       * Only HTTP/HTTPS is allowed.
+       */
+      if (
+        !["http:", "https:"].includes(
+          redirectedUrl.protocol
+        )
+      ) {
+        continue;
+      }
+
+      /*
+       * Never allow credentials.
+       */
+      if (
+        redirectedUrl.username ||
+        redirectedUrl.password
+      ) {
+        continue;
+      }
+
+      /*
+       * Never allow Facebook to turn this into
+       * an arbitrary external redirect.
+       */
+      if (
+        !isFacebookHostname(
+          redirectedUrl.hostname
+        )
+      ) {
+        continue;
+      }
+
+      /*
+       * Direct canonical media URL.
+       *
+       * Example:
+       *
+       * https://www.facebook.com/reel/1045549397960163/
+       */
+      if (
+        isFacebookMediaUrl(
+          redirectedUrl
+        )
+      ) {
+        /*
+         * Run our existing SSRF validation
+         * against the resolved URL.
+         */
+        const validated =
+          await validateMediaUrl(
+            redirectedUrl.toString()
+          );
+
+        return validated;
+      }
+
+      /*
+       * Sometimes the redirect URL contains
+       * a media ID even if its path isn't one
+       * of our known canonical paths.
+       */
+      const extracted =
+        extractFacebookMediaUrl(
+          redirectedUrl.toString()
+        );
+
+      if (extracted) {
+        const validated =
+          await validateMediaUrl(
+            extracted.toString()
+          );
+
+        return validated;
+      }
+
+      /*
+       * Handle:
+       *
+       * /login/?next=https://facebook.com/reel/123
+       *
+       * This is not expected to be necessary for
+       * the HEAD behavior we verified, but keeping
+       * this fallback makes the resolver more robust.
+       */
+      if (
+        redirectedUrl.pathname ===
+          "/login" ||
+        redirectedUrl.pathname ===
+          "/login/"
+      ) {
+        const next =
+          redirectedUrl.searchParams.get(
+            "next"
+          );
+
+        if (next) {
+          const nextMedia =
+            extractFacebookMediaUrl(
+              next
+            );
+
+          if (nextMedia) {
+            const validated =
+              await validateMediaUrl(
+                nextMedia.toString()
+              );
+
+            return validated;
+          }
+        }
+      }
+    } catch {
+      /*
+       * Try the next Facebook hostname.
+       */
+      continue;
+    }
+  }
+
+  /*
+   * If HEAD did not resolve the URL, try GET
+   * as a fallback.
+   */
+  for (
+    const candidate
+    of uniqueCandidates
+  ) {
+    try {
+      const response =
+        await fetch(
+          candidate.toString(),
+          {
+            method: "GET",
+            redirect: "manual",
+
+            headers: {
+              "User-Agent":
+                "curl/8.0.0",
+
+              Accept:
+                "text/html,application/xhtml+xml,*/*;q=0.8",
+            },
+
+            signal:
+              AbortSignal.timeout(
+                10_000
+              ),
+          }
+        );
+
+      const location =
+        response.headers.get(
+          "location"
+        );
+
+      if (location) {
+        let redirectedUrl: URL;
+
+        try {
+          redirectedUrl =
+            new URL(
+              location,
+              candidate
+            );
+        } catch {
+          continue;
+        }
+
+        if (
+          !isFacebookHostname(
+            redirectedUrl.hostname
+          )
+        ) {
+          continue;
+        }
+
+        if (
+          !["http:", "https:"].includes(
+            redirectedUrl.protocol
+          )
+        ) {
+          continue;
+        }
+
+        if (
+          redirectedUrl.username ||
+          redirectedUrl.password
+        ) {
+          continue;
+        }
+
+        /*
+         * Direct Reel destination.
+         */
+        if (
+          isFacebookMediaUrl(
+            redirectedUrl
+          )
+        ) {
+          const validated =
+            await validateMediaUrl(
+              redirectedUrl.toString()
+            );
+
+          return validated;
+        }
+
+        /*
+         * Extract media ID from redirect.
+         */
+        const extracted =
+          extractFacebookMediaUrl(
+            redirectedUrl.toString()
+          );
+
+        if (extracted) {
+          const validated =
+            await validateMediaUrl(
+              extracted.toString()
+            );
+
+          return validated;
+        }
+
+        /*
+         * Handle login/?next=...
+         */
+        if (
+          redirectedUrl.pathname ===
+            "/login" ||
+          redirectedUrl.pathname ===
+            "/login/"
+        ) {
+          const next =
+            redirectedUrl.searchParams.get(
+              "next"
+            );
+
+          if (next) {
+            const nextMedia =
+              extractFacebookMediaUrl(
+                next
+              );
+
+            if (nextMedia) {
+              const validated =
+                await validateMediaUrl(
+                  nextMedia.toString()
+                );
+
+              return validated;
+            }
+          }
+        }
+      }
+
+      /*
+       * If Facebook returned HTML, inspect
+       * canonical/Open Graph URLs.
+       */
+      const contentType =
+        response.headers.get(
+          "content-type"
+        ) ?? "";
+
+      if (
+        contentType.includes(
+          "text/html"
+        ) ||
+        contentType.includes(
+          "application/xhtml+xml"
+        )
+      ) {
+        const html =
+          await response.text();
+
+        const patterns = [
+          /<link[^>]+rel=["']canonical["'][^>]+href=["']([^"']+)["']/i,
+
+          /<link[^>]+href=["']([^"']+)["'][^>]+rel=["']canonical["']/i,
+
+          /<meta[^>]+property=["']og:url["'][^>]+content=["']([^"']+)["']/i,
+
+          /<meta[^>]+content=["']([^"']+)["'][^>]+property=["']og:url["']/i,
+        ];
+
+        for (
+          const pattern
+          of patterns
+        ) {
+          const match =
+            html.match(pattern);
+
+          if (!match?.[1]) {
+            continue;
+          }
+
+          const mediaUrl =
+            extractFacebookMediaUrl(
+              match[1]
+            );
+
+          if (mediaUrl) {
+            const validated =
+              await validateMediaUrl(
+                mediaUrl.toString()
+              );
+
+            return validated;
+          }
+        }
+
+        /*
+         * Last HTML fallback: search the entire
+         * response for a Facebook Reel URL.
+         */
+        const mediaUrl =
+          extractFacebookMediaUrl(
+            html
+          );
+
+        if (mediaUrl) {
+          const validated =
+            await validateMediaUrl(
+              mediaUrl.toString()
+            );
+
+          return validated;
+        }
+      }
+    } catch {
+      continue;
+    }
+  }
+
+  /*
+   * No canonical destination was found.
+   *
+   * Return the original URL so yt-dlp can make
+   * its own attempt.
+   */
+  return url;
 }
 
 function getFriendlyMediaError(
@@ -173,6 +790,35 @@ export async function getMediaInfo(
   url: string
 ) {
   try {
+    /*
+     * First validate the URL using the existing
+     * SSRF protection.
+     */
+    const validatedUrl =
+      await validateMediaUrl(
+        url
+      );
+
+    /*
+     * IMPORTANT:
+     *
+     * Explicitly resolve Facebook share URLs
+     * BEFORE invoking yt-dlp.
+     */
+    const mediaUrl =
+      await resolveFacebookShareUrl(
+        validatedUrl
+      );
+
+    /*
+     * This is the URL that will actually be
+     * handed to yt-dlp.
+     */
+    console.log(
+      "SaveFlow media URL:",
+      mediaUrl.toString()
+    );
+
     const { stdout } =
       await execFileAsync(
         "python",
@@ -193,30 +839,31 @@ export async function getMediaInfo(
           "--check-formats",
 
           /*
-           * Deno is installed in the production
-           * Docker image and is the recommended
-           * JS runtime for yt-dlp EJS.
+           * Deno is installed in production.
            */
           "--js-runtimes",
           "deno",
 
           /*
-           * Allow yt-dlp to obtain the current
-           * EJS challenge scripts when needed.
+           * Allow yt-dlp to obtain current
+           * EJS challenge scripts.
            */
           "--remote-components",
           "ejs:npm",
 
           /*
-           * Use the BgUtils PO Token provider.
-           *
-           * The provider is built into the production
-           * Docker image at this location.
+           * BgUtils PO Token provider.
            */
           "--extractor-args",
           "youtubepot-bgutilscript:server_home=/opt/bgutil-ytdlp-pot-provider/server",
 
-          url,
+          /*
+           * CRITICAL:
+           *
+           * Use the resolved URL, NOT the original
+           * Facebook /share/r/ URL.
+           */
+          mediaUrl.toString(),
         ],
         {
           maxBuffer:
@@ -325,7 +972,7 @@ export async function getMediaInfo(
 
       webpageUrl:
         data.webpage_url ||
-        url,
+        mediaUrl.toString(),
 
       extractor:
         data.extractor ||
