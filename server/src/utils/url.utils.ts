@@ -223,14 +223,93 @@ function isFacebookShareUrl(
       url.hostname
     ) &&
     (
+      url.pathname === "/share" ||
       url.pathname.startsWith(
         "/share/"
-      ) ||
-      url.pathname.startsWith(
-        "/share/r/"
       )
     )
   );
+}
+
+/**
+ * Facebook sometimes redirects:
+ *
+ * /share/r/ABC123/
+ *
+ * to:
+ *
+ * /login/?next=https%3A%2F%2Fwww.facebook.com%2Fshare%2Fr%2FABC123%2F
+ *
+ * We must NOT pass that login URL to yt-dlp.
+ *
+ * Instead, recover the URL contained in the `next`
+ * parameter and return the original Facebook share
+ * URL so yt-dlp can attempt to handle it.
+ */
+function recoverFacebookShareUrlFromLogin(
+  url: URL
+): URL | null {
+  if (
+    !isFacebookHostname(
+      url.hostname
+    )
+  ) {
+    return null;
+  }
+
+  if (
+    url.pathname !== "/login/" &&
+    url.pathname !== "/login"
+  ) {
+    return null;
+  }
+
+  const next = url.searchParams.get(
+    "next"
+  );
+
+  if (!next) {
+    return null;
+  }
+
+  let nextUrl: URL;
+
+  try {
+    nextUrl = new URL(next);
+  } catch {
+    return null;
+  }
+
+  if (
+    !["http:", "https:"].includes(
+      nextUrl.protocol
+    )
+  ) {
+    return null;
+  }
+
+  if (
+    nextUrl.username ||
+    nextUrl.password
+  ) {
+    return null;
+  }
+
+  if (
+    !isFacebookHostname(
+      nextUrl.hostname
+    )
+  ) {
+    return null;
+  }
+
+  if (
+    !isFacebookShareUrl(nextUrl)
+  ) {
+    return null;
+  }
+
+  return nextUrl;
 }
 
 async function resolveFacebookShareUrl(
@@ -267,9 +346,11 @@ async function resolveFacebookShareUrl(
       }
     );
   } catch {
-    throw new Error(
-      "Unable to resolve the Facebook share URL."
-    );
+    /*
+     * If Facebook itself cannot be reached,
+     * leave the original URL for yt-dlp.
+     */
+    return url;
   }
 
   const location =
@@ -334,6 +415,30 @@ async function resolveFacebookShareUrl(
       redirectedUrl.hostname
     );
 
+    /*
+     * IMPORTANT:
+     *
+     * If Facebook redirected us to:
+     *
+     * /login/?next=<original-share-url>
+     *
+     * don't return the login URL.
+     *
+     * Recover the original share URL instead.
+     */
+    const recoveredShareUrl =
+      recoverFacebookShareUrlFromLogin(
+        redirectedUrl
+      );
+
+    if (recoveredShareUrl) {
+      return recoveredShareUrl;
+    }
+
+    /*
+     * If this is a real Facebook destination
+     * such as /reel/123456, return it normally.
+     */
     return redirectedUrl;
   }
 
@@ -341,9 +446,8 @@ async function resolveFacebookShareUrl(
    * Some Facebook share URLs may return the
    * destination without a normal HTTP redirect.
    *
-   * If Facebook doesn't provide a location header,
-   * leave the original URL intact and allow yt-dlp
-   * to handle it.
+   * Leave the original URL intact and allow
+   * yt-dlp to handle it.
    */
   return url;
 }
@@ -405,7 +509,7 @@ export async function validateMediaUrl(
 
   /*
    * Facebook share URLs are resolved to their
-   * actual Facebook media URL.
+   * actual Facebook media URL when possible.
    */
   const resolvedUrl =
     await resolveFacebookShareUrl(
@@ -416,8 +520,8 @@ export async function validateMediaUrl(
    * Validate the final URL again.
    *
    * This is important because the destination
-   * must receive the same SSRF protection as the
-   * original URL.
+   * must receive the same SSRF protection as
+   * the original URL.
    */
   await validateHostname(
     resolvedUrl.hostname
