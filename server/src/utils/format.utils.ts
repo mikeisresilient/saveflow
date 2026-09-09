@@ -94,11 +94,41 @@ function hasVideo(
 function hasAudio(
   format: RawFormat,
 ): boolean {
-  return Boolean(
+  /*
+   * Normal audio formats expose an audio
+   * codec through yt-dlp.
+   */
+  if (
     format.audioCodec &&
-      format.audioCodec !== "none" &&
-      format.audioCodec !== "unknown",
-  );
+    format.audioCodec !== "none" &&
+    format.audioCodec !== "unknown"
+  ) {
+    return true;
+  }
+
+  /*
+   * X/Twitter can expose HLS audio streams
+   * with an audio format ID while yt-dlp
+   * reports acodec as null.
+   *
+   * Example:
+   *
+   * hls-audio-32000-Audio
+   * hls-audio-64000-Audio
+   * hls-audio-128000-Audio
+   */
+  const formatId =
+    format.formatId.toLowerCase();
+
+  if (
+    formatId.startsWith(
+      "hls-audio-"
+    )
+  ) {
+    return true;
+  }
+
+  return false;
 }
 
 function isUsableVideoExtension(

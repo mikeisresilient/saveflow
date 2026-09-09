@@ -9,24 +9,25 @@ RUN apt-get update \
         ca-certificates \
         curl \
         unzip \
+        git \
     && rm -rf /var/lib/apt/lists/*
 
 #
-# Install Deno.
+# Install Deno
 #
 RUN curl -fsSL https://deno.land/install.sh | sh
 
 ENV PATH="/root/.deno/bin:${PATH}"
 
 #
-# Python virtual environment.
+# Create Python virtual environment
 #
 RUN python3 -m venv /opt/venv
 
 ENV PATH="/opt/venv/bin:${PATH}"
 
 #
-# yt-dlp + EJS + PO Token provider.
+# Install yt-dlp, EJS and BgUtils PO Token provider
 #
 RUN pip install --no-cache-dir --upgrade pip \
     && pip install --no-cache-dir \
@@ -34,7 +35,17 @@ RUN pip install --no-cache-dir --upgrade pip \
         "bgutil-ytdlp-pot-provider"
 
 #
-# Application.
+# Build the BgUtils PO Token script provider
+#
+RUN git clone --depth 1 \
+        https://github.com/Brainicism/bgutil-ytdlp-pot-provider.git \
+        /opt/bgutil-ytdlp-pot-provider \
+    && cd /opt/bgutil-ytdlp-pot-provider/server \
+    && npm install \
+    && npm run build
+
+#
+# Application
 #
 WORKDIR /app
 

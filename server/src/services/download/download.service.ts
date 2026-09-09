@@ -219,15 +219,14 @@ async function validateActualFileSize(
   }
 }
 
-async function runYtDlp(
-  args: string[],
-  timeout: number
-): Promise<void> {
+async function runYtDlp(args: string[], timeout: number): Promise<void> {
   const finalArgs = [
     "--js-runtimes",
     "deno",
     "--remote-components",
     "ejs:npm",
+    "--extractor-args",
+    "youtubepot-bgutilscript:server_home=/opt/bgutil-ytdlp-pot-provider/server",
     ...args,
   ];
 
