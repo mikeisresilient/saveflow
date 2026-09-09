@@ -206,7 +206,6 @@ export async function getMediaInfo(
            */
           "--remote-components",
           "ejs:npm",
-          "--verbose",
 
           /*
            * Use the BgUtils PO Token provider.

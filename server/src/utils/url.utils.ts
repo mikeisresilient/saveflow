@@ -8,6 +8,13 @@ const BLOCKED_HOSTNAMES = new Set([
   "ip6-loopback",
 ]);
 
+const FACEBOOK_HOSTNAMES = new Set([
+  "facebook.com",
+  "www.facebook.com",
+  "m.facebook.com",
+  "web.facebook.com",
+]);
+
 function isPrivateIPv4(ip: string): boolean {
   const parts = ip.split(".").map(Number);
 
@@ -116,6 +123,231 @@ function isBlockedAddress(
   return false;
 }
 
+async function validateHostname(
+  hostname: string
+): Promise<void> {
+  const normalizedHostname =
+    hostname.toLowerCase();
+
+  if (!normalizedHostname) {
+    throw new Error(
+      "The provided URL has no hostname."
+    );
+  }
+
+  if (
+    BLOCKED_HOSTNAMES.has(
+      normalizedHostname
+    )
+  ) {
+    throw new Error(
+      "Local and internal URLs are not allowed."
+    );
+  }
+
+  if (
+    isBlockedAddress(
+      normalizedHostname
+    )
+  ) {
+    throw new Error(
+      "Private and internal IP addresses are not allowed."
+    );
+  }
+
+  if (net.isIP(normalizedHostname)) {
+    return;
+  }
+
+  try {
+    const addresses =
+      await dns.lookup(
+        normalizedHostname,
+        {
+          all: true,
+          verbatim: true,
+        }
+      );
+
+    if (!addresses.length) {
+      throw new Error(
+        "Unable to resolve the media host."
+      );
+    }
+
+    for (const address of addresses) {
+      if (
+        isBlockedAddress(
+          address.address
+        )
+      ) {
+        throw new Error(
+          "The provided URL resolves to a private or internal network."
+        );
+      }
+    }
+  } catch (error) {
+    if (
+      error instanceof Error &&
+      (
+        error.message.includes(
+          "private or internal network"
+        ) ||
+        error.message.includes(
+          "Unable to resolve the media host"
+        )
+      )
+    ) {
+      throw error;
+    }
+
+    throw new Error(
+      "Unable to resolve the media host."
+    );
+  }
+}
+
+function isFacebookHostname(
+  hostname: string
+): boolean {
+  return FACEBOOK_HOSTNAMES.has(
+    hostname.toLowerCase()
+  );
+}
+
+function isFacebookShareUrl(
+  url: URL
+): boolean {
+  return (
+    isFacebookHostname(
+      url.hostname
+    ) &&
+    (
+      url.pathname.startsWith(
+        "/share/"
+      ) ||
+      url.pathname.startsWith(
+        "/share/r/"
+      )
+    )
+  );
+}
+
+async function resolveFacebookShareUrl(
+  url: URL
+): Promise<URL> {
+  /*
+   * Only resolve Facebook share URLs.
+   *
+   * This prevents arbitrary URLs from being
+   * followed as part of URL normalization.
+   */
+  if (!isFacebookShareUrl(url)) {
+    return url;
+  }
+
+  let response: Response;
+
+  try {
+    response = await fetch(
+      url.toString(),
+      {
+        method: "GET",
+        redirect: "manual",
+        headers: {
+          "User-Agent":
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0 Safari/537.36",
+          Accept:
+            "text/html,application/xhtml+xml",
+        },
+        signal:
+          AbortSignal.timeout(
+            10_000
+          ),
+      }
+    );
+  } catch {
+    throw new Error(
+      "Unable to resolve the Facebook share URL."
+    );
+  }
+
+  const location =
+    response.headers.get(
+      "location"
+    );
+
+  /*
+   * Facebook may respond with a redirect.
+   */
+  if (location) {
+    let redirectedUrl: URL;
+
+    try {
+      redirectedUrl =
+        new URL(
+          location,
+          url
+        );
+    } catch {
+      throw new Error(
+        "Facebook returned an invalid redirect URL."
+      );
+    }
+
+    if (
+      !["http:", "https:"].includes(
+        redirectedUrl.protocol
+      )
+    ) {
+      throw new Error(
+        "Facebook returned an unsupported redirect URL."
+      );
+    }
+
+    if (
+      redirectedUrl.username ||
+      redirectedUrl.password
+    ) {
+      throw new Error(
+        "Facebook returned an unsafe redirect URL."
+      );
+    }
+
+    /*
+     * Only allow Facebook destinations.
+     *
+     * This prevents the share URL from being
+     * abused as an open redirect / SSRF proxy.
+     */
+    if (
+      !isFacebookHostname(
+        redirectedUrl.hostname
+      )
+    ) {
+      throw new Error(
+        "Facebook returned an unsupported redirect destination."
+      );
+    }
+
+    await validateHostname(
+      redirectedUrl.hostname
+    );
+
+    return redirectedUrl;
+  }
+
+  /*
+   * Some Facebook share URLs may return the
+   * destination without a normal HTTP redirect.
+   *
+   * If Facebook doesn't provide a location header,
+   * leave the original URL intact and allow yt-dlp
+   * to handle it.
+   */
+  return url;
+}
+
 export async function validateMediaUrl(
   value: string
 ): Promise<URL> {
@@ -163,76 +395,33 @@ export async function validateMediaUrl(
     );
   }
 
-  const hostname =
-    parsedUrl.hostname.toLowerCase();
+  /*
+   * Validate the original hostname before doing
+   * any redirect resolution.
+   */
+  await validateHostname(
+    parsedUrl.hostname
+  );
 
-  if (!hostname) {
-    throw new Error(
-      "The provided URL has no hostname."
+  /*
+   * Facebook share URLs are resolved to their
+   * actual Facebook media URL.
+   */
+  const resolvedUrl =
+    await resolveFacebookShareUrl(
+      parsedUrl
     );
-  }
 
-  if (
-    BLOCKED_HOSTNAMES.has(hostname)
-  ) {
-    throw new Error(
-      "Local and internal URLs are not allowed."
-    );
-  }
+  /*
+   * Validate the final URL again.
+   *
+   * This is important because the destination
+   * must receive the same SSRF protection as the
+   * original URL.
+   */
+  await validateHostname(
+    resolvedUrl.hostname
+  );
 
-  if (isBlockedAddress(hostname)) {
-    throw new Error(
-      "Private and internal IP addresses are not allowed."
-    );
-  }
-
-  if (net.isIP(hostname)) {
-    return parsedUrl;
-  }
-
-  try {
-    const addresses =
-      await dns.lookup(hostname, {
-        all: true,
-        verbatim: true,
-      });
-
-    if (!addresses.length) {
-      throw new Error(
-        "Unable to resolve the media host."
-      );
-    }
-
-    for (const address of addresses) {
-      if (
-        isBlockedAddress(
-          address.address
-        )
-      ) {
-        throw new Error(
-          "The provided URL resolves to a private or internal network."
-        );
-      }
-    }
-  } catch (error) {
-    if (
-      error instanceof Error &&
-      (
-        error.message.includes(
-          "private or internal network"
-        ) ||
-        error.message.includes(
-          "Unable to resolve the media host"
-        )
-      )
-    ) {
-      throw error;
-    }
-
-    throw new Error(
-      "Unable to resolve the media host."
-    );
-  }
-
-  return parsedUrl;
+  return resolvedUrl;
 }
