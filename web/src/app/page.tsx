@@ -647,10 +647,8 @@ export default function Home() {
 
             <div className="flex flex-wrap items-center justify-center gap-2">
               {[
-                "YouTube",
                 "TikTok",
                 "Instagram",
-                "Facebook",
                 "X",
               ].map((platform) => (
                 <span
