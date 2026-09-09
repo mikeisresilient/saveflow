@@ -29,6 +29,7 @@ export interface AudioFormat {
   extension: string;
   bitrate: number | null;
   fileSize: number | null;
+  sourceType: "audio-only" | "video-with-audio";
 }
 
 export interface ProcessedFormats {
@@ -49,7 +50,7 @@ function getVideoQuality(height: number): string {
 }
 
 function getAudioQuality(
-  bitrate: number | null
+  bitrate: number | null,
 ): string {
   if (!bitrate) {
     return "Audio";
@@ -64,44 +65,44 @@ function getAudioQuality(
 }
 
 function hasVideo(
-  format: RawFormat
+  format: RawFormat,
 ): boolean {
   return Boolean(
     format.videoCodec &&
       format.videoCodec !== "none" &&
+      format.videoCodec !== "unknown" &&
       format.width &&
       format.height &&
       format.width > 0 &&
-      format.height > 0
+      format.height > 0,
   );
 }
 
 /*
- * IMPORTANT:
+ * A format containing audio can be used
+ * as an audio extraction source.
  *
- * Audio formats must be AUDIO ONLY.
+ * This includes:
  *
- * A format containing both video and audio
- * must never appear in the Audio Formats list.
+ * audio only
+ * video + audio
  *
- * Example:
- *
- * h264 + aac = VIDEO format
- * none + aac = AUDIO ONLY format
+ * For video + audio formats, the download
+ * service extracts the audio stream and
+ * returns an MP3 file.
  */
 function hasAudio(
-  format: RawFormat
+  format: RawFormat,
 ): boolean {
   return Boolean(
     format.audioCodec &&
       format.audioCodec !== "none" &&
-      (!format.videoCodec ||
-        format.videoCodec === "none")
+      format.audioCodec !== "unknown",
   );
 }
 
 function isUsableVideoExtension(
-  extension: string
+  extension: string,
 ): boolean {
   const ext = extension.toLowerCase();
 
@@ -113,7 +114,7 @@ function isUsableVideoExtension(
 }
 
 function isUsableAudioExtension(
-  extension: string
+  extension: string,
 ): boolean {
   const ext = extension.toLowerCase();
 
@@ -126,16 +127,16 @@ function isUsableAudioExtension(
 }
 
 function getVideoScore(
-  format: RawFormat
+  format: RawFormat,
 ): number {
   const extension =
     format.extension.toLowerCase();
 
-  const hasAudioStream =
-    Boolean(
-      format.audioCodec &&
-        format.audioCodec !== "none"
-    );
+  const hasAudioStream = Boolean(
+    format.audioCodec &&
+      format.audioCodec !== "none" &&
+      format.audioCodec !== "unknown",
+  );
 
   let score = 0;
 
@@ -149,9 +150,7 @@ function getVideoScore(
 
   /*
    * Prefer a format that already contains
-   * audio. This is especially important for
-   * platforms where some formats are already
-   * combined video + audio.
+   * audio.
    */
   if (hasAudioStream) {
     score += 50;
@@ -171,7 +170,7 @@ function getVideoScore(
   if (format.fps) {
     score += Math.min(
       format.fps,
-      60
+      60,
     ) / 10;
   }
 
@@ -179,7 +178,7 @@ function getVideoScore(
 }
 
 function getAudioScore(
-  format: RawFormat
+  format: RawFormat,
 ): number {
   const extension =
     format.extension.toLowerCase();
@@ -187,8 +186,8 @@ function getAudioScore(
   let score = 0;
 
   /*
-   * M4A/AAC is preferred because FFmpeg can
-   * reliably convert it to MP3.
+   * Prefer formats that are already
+   * audio-friendly.
    */
   if (extension === "m4a") {
     score += 100;
@@ -201,19 +200,38 @@ function getAudioScore(
   }
 
   /*
-   * Prefer higher bitrate when comparing
-   * otherwise equivalent audio formats.
+   * Prefer higher bitrate when available.
    */
-  score += Math.min(
-    format.bitrate ?? 0,
-    320
-  ) / 10;
+  score +=
+    Math.min(
+      format.bitrate ?? 0,
+      320,
+    ) / 10;
+
+  /*
+   * If the source is a combined
+   * video + audio format, prefer a
+   * higher-resolution source.
+   *
+   * This is useful for platforms such
+   * as X where an audio-only stream may
+   * not be exposed separately.
+   */
+  if (
+    format.width &&
+    format.height
+  ) {
+    score += Math.min(
+      format.height,
+      2160,
+    ) / 100;
+  }
 
   return score;
 }
 
 export function processFormats(
-  formats: RawFormat[]
+  formats: RawFormat[],
 ): ProcessedFormats {
   const videoMap =
     new Map<string, VideoFormat>();
@@ -227,8 +245,8 @@ export function processFormats(
      * VIDEO
      * ============================
      *
-     * Any format containing a video
-     * stream belongs in the Video list.
+     * Any format containing video
+     * belongs in the Video list.
      *
      * This includes:
      *
@@ -238,12 +256,12 @@ export function processFormats(
     if (
       hasVideo(format) &&
       isUsableVideoExtension(
-        format.extension
+        format.extension,
       )
     ) {
       const quality =
         getVideoQuality(
-          format.height!
+          format.height!,
         );
 
       const existing =
@@ -278,8 +296,8 @@ export function processFormats(
         });
       } else {
         /*
-         * Reconstruct the basic score of
-         * the existing format.
+         * Reconstruct the basic score
+         * of the existing format.
          */
         const existingScore =
           getVideoScore({
@@ -304,11 +322,6 @@ export function processFormats(
             videoCodec:
               "video",
 
-            /*
-             * We don't know whether the stored
-             * format contains audio, so this
-             * remains null.
-             */
             audioCodec:
               null,
 
@@ -352,30 +365,39 @@ export function processFormats(
 
     /*
      * ============================
-     * AUDIO ONLY
+     * AUDIO
      * ============================
      *
-     * IMPORTANT:
+     * Any format containing audio
+     * can be used as an audio source.
      *
-     * hasAudio() now guarantees that
-     * the format does NOT contain video.
+     * This includes:
      *
-     * Therefore formats such as:
+     * audio only
+     * video + audio
      *
-     * h264_540p_431187-0
-     *
-     * will NOT be added to Audio.
+     * For combined formats such as
+     * X video formats, the download
+     * service extracts the audio stream
+     * and converts it to MP3.
      */
     if (
       hasAudio(format) &&
       isUsableAudioExtension(
-        format.extension
+        format.extension,
       )
     ) {
+      const sourceType =
+        hasVideo(format)
+          ? "video-with-audio"
+          : "audio-only";
+
       const quality =
-        getAudioQuality(
-          format.bitrate ?? null
-        );
+        sourceType === "audio-only"
+          ? getAudioQuality(
+              format.bitrate ?? null,
+            )
+          : "Audio";
 
       const existing =
         audioMap.get(quality);
@@ -389,14 +411,19 @@ export function processFormats(
 
           quality,
 
-          extension:
-            format.extension.toLowerCase(),
+          /*
+           * SaveFlow always returns MP3
+           * for audio downloads.
+           */
+          extension: "mp3",
 
           bitrate:
             format.bitrate ?? null,
 
           fileSize:
             format.fileSize ?? null,
+
+          sourceType,
         });
       } else {
         const currentScore =
@@ -417,10 +444,16 @@ export function processFormats(
               existing.fileSize,
 
             width:
-              null,
+              existing.sourceType ===
+              "video-with-audio"
+                ? 720
+                : null,
 
             height:
-              null,
+              existing.sourceType ===
+              "video-with-audio"
+                ? 720
+                : null,
 
             resolution:
               null,
@@ -429,7 +462,10 @@ export function processFormats(
               null,
 
             videoCodec:
-              null,
+              existing.sourceType ===
+              "video-with-audio"
+                ? "video"
+                : null,
 
             audioCodec:
               "audio",
@@ -447,14 +483,15 @@ export function processFormats(
 
             quality,
 
-            extension:
-              format.extension.toLowerCase(),
+            extension: "mp3",
 
             bitrate:
               format.bitrate ?? null,
 
             fileSize:
               format.fileSize ?? null,
+
+            sourceType,
           });
         }
       }
@@ -479,15 +516,53 @@ export function processFormats(
 
   const video =
     Array.from(
-      videoMap.values()
+      videoMap.values(),
     ).sort(
-      (a, b) =>
-        qualityOrder.indexOf(
-          a.quality
-        ) -
-        qualityOrder.indexOf(
-          b.quality
-        )
+      (a, b) => {
+        const aIndex =
+          qualityOrder.indexOf(
+            a.quality,
+          );
+
+        const bIndex =
+          qualityOrder.indexOf(
+            b.quality,
+          );
+
+        /*
+         * Known quality values first.
+         */
+        if (
+          aIndex !== -1 &&
+          bIndex !== -1
+        ) {
+          return aIndex - bIndex;
+        }
+
+        if (
+          aIndex !== -1
+        ) {
+          return -1;
+        }
+
+        if (
+          bIndex !== -1
+        ) {
+          return 1;
+        }
+
+        /*
+         * Fallback for unusual
+         * resolutions.
+         */
+        const aHeight =
+          a.height;
+
+        const bHeight =
+          b.height;
+
+        return bHeight - aHeight;
+      },
     );
 
   /*
@@ -495,16 +570,30 @@ export function processFormats(
    * SORT AUDIO
    * ============================
    *
-   * Highest bitrate first.
+   * Audio-only sources first,
+   * followed by audio extracted
+   * from combined video + audio.
    */
-
   const audio =
     Array.from(
-      audioMap.values()
+      audioMap.values(),
     ).sort(
-      (a, b) =>
-        (b.bitrate ?? 0) -
-        (a.bitrate ?? 0)
+      (a, b) => {
+        if (
+          a.sourceType !==
+          b.sourceType
+        ) {
+          return a.sourceType ===
+            "audio-only"
+            ? -1
+            : 1;
+        }
+
+        return (
+          (b.bitrate ?? 0) -
+          (a.bitrate ?? 0)
+        );
+      },
     );
 
   return {
