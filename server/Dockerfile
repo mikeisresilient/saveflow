@@ -35,14 +35,14 @@ RUN pip install --no-cache-dir --upgrade pip \
         "bgutil-ytdlp-pot-provider"
 
 #
-# Build the BgUtils PO Token script provider
+# Clone and build the BgUtils PO Token script provider
 #
-RUN git clone --depth 1 \
+RUN git clone --depth 1 --branch 2.0.0 \
         https://github.com/Brainicism/bgutil-ytdlp-pot-provider.git \
         /opt/bgutil-ytdlp-pot-provider \
     && cd /opt/bgutil-ytdlp-pot-provider/server \
-    && npm install \
-    && npm run build
+    && npm ci \
+    && npx tsc
 
 #
 # Application
