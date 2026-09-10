@@ -869,7 +869,7 @@ export default function Home() {
                     return (
                       <article
                         key={format.formatId}
-                        className="group flex min-w-0 flex-col rounded-2xl border border-white/10 bg-white/[0.03] p-4 transition-colors duration-200 hover:border-cyan-400/30 hover:bg-white/[0.05]"
+                        className="group flex min-w-0 flex-col rounded-2xl border border-white/10 bg-white/3 p-4 transition-colors duration-200 hover:border-cyan-400/30 hover:bg-white/[0.05]"
                       >
                         <div className="flex items-start justify-between gap-4">
                           <div className="min-w-0">
